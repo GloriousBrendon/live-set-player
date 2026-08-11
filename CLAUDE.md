@@ -15,10 +15,15 @@ and sounds fine on your machine.
    or atomics. Buffers released by the audio thread are sent to a garbage queue and
    dropped on a worker thread.
 
-2. **Never accumulate beat positions.** `samples_per_beat` is an `f64` and is almost
-   never an integer (178 BPM @ 48 kHz = 16179.775). Every event position is computed
-   as `round(absolute_beat_index * samples_per_beat) + song.offset_samples`.
+2. **Never accumulate beat positions.** BPM is quarter-notes-per-minute (DAW
+   convention); the click grid ticks in *pulses* (one tick of the time signature's
+   denominator), so `samples_per_pulse = sample_rate * 60 / bpm * 4 / denominator` is
+   an `f64` and is almost never an integer (178 BPM @ 48 kHz = 16179.775 in 4/4;
+   8089.887640449438 in 7/8). Every event position is computed as
+   `round(absolute_pulse_index * samples_per_pulse) + song.offset_samples`.
    Incremental addition drifts and is the single worst failure mode in this project.
+   `offset_samples` applies only when mapping to source-file frames, never to
+   performance-time scheduling — see `docs/SPEC.md` §2.
 
 3. **One project sample rate.** All audio is resampled to it and downmixed to mono
    at load time, on a worker thread. Nothing is resampled at playback time.
@@ -40,8 +45,9 @@ immunity, not low latency.
 ## Conventions
 
 - Rust: `cargo fmt`, `cargo clippy -- -D warnings` must pass before any commit.
-- The audio engine is a standalone library crate with no Tauri dependency, so it can
-  be unit tested and driven headlessly by the offline renderer.
+- The audio engine is a standalone library crate at `src-tauri/engine/` (package
+  `lsp-engine`, a workspace member of `src-tauri/`), with no Tauri dependency, so it
+  can be unit tested and driven headlessly by the offline renderer.
 - Frontend: Svelte + TypeScript. The UI never touches engine state directly; it
   sends commands and reads a status snapshot.
 - Prefer small, testable commits. Run the drift tests after any change to timing code.

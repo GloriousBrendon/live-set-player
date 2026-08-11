@@ -1,0 +1,23 @@
+[package]
+name = "lsp-engine"
+version = "0.1.0"
+description = "Live Set Player audio timeline, project model, and offline renderer. No Tauri dependency -- unit testable and drivable headlessly."
+authors = ["you"]
+edition = "2021"
+
+# CLAUDE.md: "The audio engine is a standalone library crate with no Tauri dependency,
+# so it can be unit tested and driven headlessly by the offline renderer." Do not add
+# a tauri dependency here, ever -- that is what makes this crate testable in ~1s instead
+# of pulling in the whole app.
+
+[lib]
+name = "lsp_engine"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hound = "3"
+thiserror = "2"
+
+[dev-dependencies]

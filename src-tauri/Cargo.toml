@@ -1,3 +1,10 @@
+[workspace]
+members = ["engine"]
+# The app crate below (lsp-scaffold) is the default workspace member. It does not
+# depend on lsp-engine yet -- that wiring happens in phase 2, when the Tauri layer
+# starts driving the audio engine. Phase 1 only needs `engine` buildable and testable
+# on its own: `cargo test -p lsp-engine`.
+
 [package]
 name = "lsp-scaffold"
 version = "0.1.0"

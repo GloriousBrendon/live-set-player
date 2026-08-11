@@ -76,12 +76,14 @@ a WebView2 problem and an audio problem at the same time is miserable.
 
 ### 0.4 Rust dependencies
 
-```powershell
-cd src-tauri
-cargo add cpal midir rtrb hound rubato anyhow thiserror serde_json
-cargo add serde --features derive
-cd ..
-```
+Do **not** add engine dependencies (`cpal`, `midir`, `rtrb`, `hound`, `rubato`,
+`thiserror`, ...) to `src-tauri/Cargo.toml` (the Tauri app crate) here or at any point.
+They belong to `src-tauri/engine/` (package `lsp-engine`), the standalone,
+Tauri-free crate phase 1 creates as a workspace member — see CLAUDE.md's Conventions
+section. Each phase's session adds the dependencies it needs to whichever crate it's
+extending (phase 1: `serde`, `serde_json`, `hound`, `thiserror` in `engine/Cargo.toml`;
+phase 2 onward: `cpal`, `rtrb`, `rubato`, etc., also in `engine/Cargo.toml` unless the
+dependency is Tauri-command-layer-only). There is nothing to run manually in this step.
 
 `piper-rs` gets added in phase 4, not now.
 
@@ -128,7 +130,7 @@ If it is, save it for phase 2. Then paste the phase 1 prompt below.
 You are already in this session from step 0.7. Paste:
 > Read CLAUDE.md and docs/SPEC.md in full.
 >
-> This session covers phase 1 only: the timeline model and the offline render harness. Do not touch cpal, Tauri, or the frontend. Build `src-tauri/src/engine/` as a standalone library module with no Tauri dependency, so it can be unit tested and driven headlessly.
+> This session covers phase 1 only: the timeline model and the offline render harness. Do not touch cpal, Tauri, or the frontend. Build `src-tauri/engine/` as a standalone library crate (its own `Cargo.toml`, a workspace member of `src-tauri/`) with no Tauri dependency, so it can be unit tested and driven headlessly.
 >
 > Deliverables:
 >
@@ -153,7 +155,7 @@ claude --model fable        # or: claude --model opus --effort xhigh
 The hardest phase and the one worth the better model. Cross-cutting, ambiguous, and the
 place where a subtle mistake costs you a gig.
 
-> Read CLAUDE.md and docs/SPEC.md in full, then read the existing `src-tauri/src/engine/` module.
+> Read CLAUDE.md and docs/SPEC.md in full, then read the existing `src-tauri/engine/` module.
 >
 > Phase 1 is complete: the timeline model, project types, and offline renderer exist and are tested. This session builds the real-time audio engine on top of them. No Tauri commands and no frontend work yet — expose a clean Rust API that the offline renderer and a future Tauri layer can both drive.
 >
@@ -184,7 +186,7 @@ place where a subtle mistake costs you a gig.
 claude --model sonnet
 ```
 
-> Read CLAUDE.md and docs/SPEC.md §5 and §6, then read `src-tauri/src/engine/`.
+> Read CLAUDE.md and docs/SPEC.md §5 and §6, then read `src-tauri/engine/`.
 >
 > Add the generated click synth and count-in to the existing engine.
 >
@@ -210,7 +212,7 @@ claude --model sonnet
 
 Start with the spike. If `piper-rs` fights you, stop and tell me before building around it.
 
-> Read CLAUDE.md and docs/SPEC.md §8, then read `src-tauri/src/engine/`.
+> Read CLAUDE.md and docs/SPEC.md §8, then read `src-tauri/engine/`.
 >
 > Add offline TTS cue generation and scheduling.
 >
@@ -239,7 +241,7 @@ Start with the spike. If `piper-rs` fights you, stop and tell me before building
 claude --model sonnet
 ```
 
-> Read CLAUDE.md and docs/SPEC.md §7, §9, and §11, then read `src-tauri/src/engine/`.
+> Read CLAUDE.md and docs/SPEC.md §7, §9, and §11, then read `src-tauri/engine/`.
 >
 > Build the Tauri command layer and a Svelte frontend. The UI never touches engine state directly: it sends commands over the existing command queue and polls a status snapshot at about 30 Hz.
 >

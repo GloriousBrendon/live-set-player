@@ -77,12 +77,35 @@ Requirements:
 This is the core of the application. Get it exactly right.
 
 - Transport position is `u64` samples since song start.
-- `samples_per_beat: f64 = sample_rate * 60.0 / bpm`. At 178 BPM / 48 kHz this is
-  16179.775 — **not an integer**.
-- Convert bar/beat to samples from the **absolute beat index**:
-  `sample = round(absolute_beat_index * samples_per_beat) + song.offset_samples`
-- **Never** compute the next beat by adding `samples_per_beat` to the previous one.
+- BPM counts **quarter notes per minute** (the DAW convention, not a 4/4-only
+  shorthand). The click grid ticks in **pulses**, where one pulse is one tick of the
+  time signature's *denominator* — a quarter note in 4/4, an eighth note in 7/8 — so
+  the pulse duration also depends on the denominator:
+  `samples_per_pulse: f64 = sample_rate * 60.0 / bpm * 4.0 / denominator`.
+  In 4/4 (denominator 4) this reduces to the old `sample_rate * 60.0 / bpm`, so 178 BPM
+  @ 48 kHz is still 16179.775 samples/pulse — **not an integer**. In 7/8 (denominator
+  8) at 178 BPM it's 8089.887640449438 samples/pulse, and pulses tick at 356/minute,
+  not 178/minute. A bar is `numerator` pulses.
+- Convert bar/beat to samples from the **absolute pulse index**:
+  `sample = round(absolute_pulse_index * samples_per_pulse) + song.offset_samples`
+- **Never** compute the next pulse by adding `samples_per_pulse` to the previous one.
   Incremental accumulation drifts audibly within a few minutes.
+
+**Performance time vs. source frames.** There are two coordinate systems, and keeping
+them separate is what makes reordering a song free:
+
+- **Performance time** is the output/transport timeline. Pulse 0 is the first beat of
+  the first performance bar. Click, cues, and section boundaries are all scheduled in
+  this space, and it has **no offset** — `sample = round(absolute_pulse_index *
+  samples_per_pulse)`, full stop.
+- **Source frames** are positions inside a backtrack file:
+  `source_frame = round(source_pulse_index * samples_per_pulse) + song.offset_samples`.
+  `offset_samples` (where bar 1 beat 1 sits inside the backtrack file — see below)
+  applies **only** here, never to performance-time scheduling.
+
+Resolving a performance order (§7) is the mapping from performance-time pulses to
+source frames. The click scheduler never needs to know a reorder happened; it only
+ever asks the grid for performance-time positions.
 
 **Song offset:** every song has `offset_samples` — where bar 1 beat 1 sits inside the
 backtrack file. Reaper renders frequently carry leading silence. Expose this as a nudge
@@ -145,8 +168,10 @@ Real-time synthesised metronome. Not sample playback.
 
 - Short enveloped tone: sine or triangle with fast exponential decay (~30–50 ms).
 - Accent: distinct pitch and level on beat 1. Configurable accent pattern per song as an
-  array of intensities, one per beat in the bar (e.g. `[2,0,0,0]` for 4/4, `[2,0,0,1,0,0,0]`
-  for 7/8). Supports odd meters.
+  array of intensities, one per **pulse** in the bar (i.e. length equals the time
+  signature's numerator) — e.g. `[2,0,0,0]` for 4/4, `[2,0,0,1,0,0,0]` for 7/8, where
+  each entry corresponds to one eighth-note pulse, not one quarter-note beat. Supports
+  odd meters.
 - Independent click gain, separate from backtrack gain, on its own bus.
 - The click scheduler reads beat positions from the timeline model in §2, so it cannot
   drift from section timing by construction.
