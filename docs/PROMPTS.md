@@ -10,8 +10,12 @@ and compaction is where architectural decisions get quietly forgotten.
 - Paste the prompt verbatim.
 - Every prompt ends with "plan first and wait for approval." Read the plan. This is the
   cheapest place to catch a misunderstanding.
-- At the end of a phase: `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test`, commit,
-  then exit. Start the next phase in a fresh session.
+- At the end of a phase: `cargo fmt`, `cargo clippy --workspace -- -D warnings`,
+  `cargo test --workspace`, commit, then exit. Start the next phase in a fresh session.
+  `--workspace` is required on clippy and test — this workspace has a root package
+  (`lsp-scaffold`) alongside the `engine` member, so the bare commands silently skip
+  `lsp-engine` and check/test only the empty scaffold app. `cargo fmt` is unaffected;
+  it covers the whole workspace by default.
 - Switching models mid-session re-reads the whole conversation uncached, so pick the model
   at launch rather than switching partway through.
 
@@ -142,7 +146,7 @@ You are already in this session from step 0.7. Paste:
 >
 > Plan first, show me the plan, and wait for approval before writing code.
 
-**Done when:** `cargo test` passes, and a click-only WAV rendered at 178 BPM lines up with a 178 BPM grid in a DAW for ten straight minutes.
+**Done when:** `cargo test --workspace` passes, and a click-only WAV rendered at 178 BPM lines up with a 178 BPM grid in a DAW for ten straight minutes.
 
 ---
 
@@ -318,7 +322,7 @@ Run this once phase 2 is done — you want Linux breakage caught early, not at t
 > Set up GitHub Actions to build and test on both platforms. I develop on Windows and cannot currently test on Linux, so CI is my only Linux verification.
 >
 > - Matrix over `windows-latest` and `ubuntu-22.04`.
-> - On every push: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test` on both platforms.
+> - On every push: `cargo fmt --check`, `cargo clippy --workspace -- -D warnings`, `cargo test --workspace` on both platforms. `--workspace` matters: this workspace has a root package (`lsp-scaffold`) alongside the `engine` member, so the bare commands silently skip `lsp-engine` and only check/test the empty scaffold app.
 > - On tag push: `tauri-action` producing NSIS `.exe` for Windows and AppImage plus `.deb` for Linux, attached to a GitHub release.
 > - Install the Linux system dependencies the runner needs, including the ALSA development headers that cpal and midir require — these are easy to forget because they are not in Tauri's own prerequisite list.
 > - Do not attempt to cross-compile Windows from Linux or the reverse.

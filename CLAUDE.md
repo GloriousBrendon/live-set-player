@@ -44,7 +44,10 @@ immunity, not low latency.
 
 ## Conventions
 
-- Rust: `cargo fmt`, `cargo clippy -- -D warnings` must pass before any commit.
+- Rust: `cargo fmt`, `cargo clippy --workspace -- -D warnings` must pass before any commit.
+  `--workspace` is required: this workspace has a root package (`lsp-scaffold`) alongside
+  the `engine` member, so a bare `cargo clippy` from `src-tauri/` silently checks only
+  `lsp-scaffold` and skips `lsp-engine` — where all the real logic lives — entirely.
 - The audio engine is a standalone library crate at `src-tauri/engine/` (package
   `lsp-engine`, a workspace member of `src-tauri/`), with no Tauri dependency, so it
   can be unit tested and driven headlessly by the offline renderer.
@@ -54,7 +57,8 @@ immunity, not low latency.
 
 ## Verification
 
-`cargo test` must pass. Timing changes must also be checked with the offline
+`cargo test --workspace` must pass (bare `cargo test` has the same `lsp-engine`-skipping
+problem as bare `cargo clippy` above, for the same reason). Timing changes must also be checked with the offline
 renderer (`docs/SPEC.md` §12), which renders a song to a stereo WAV with backtrack
 left and click/cues right for inspection in a DAW.
 
