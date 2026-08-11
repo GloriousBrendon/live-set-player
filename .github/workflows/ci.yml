@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+
+# Cancel superseded runs on the same branch, but never on a tag push (a release
+# build should always run to completion).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  # cpal's ALSA backend and midir (if ever added) both need `libasound2-dev`;
+  # Tauri needs the rest. None of these are in Tauri's own prerequisite list.
+  LINUX_DEPS: >-
+    libwebkit2gtk-4.1-dev
+    libappindicator3-dev
+    librsvg2-dev
+    patchelf
+    build-essential
+    curl
+    wget
+    file
+    libxdo-dev
+    libssl-dev
+    libasound2-dev
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ env.LINUX_DEPS }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      # Bare `cargo fmt --check` covers every workspace member. Bare `cargo
+      # clippy`/`cargo test` do NOT -- this workspace has a root package
+      # (lsp-scaffold) alongside the `engine` member, so without `--workspace`
+      # both commands silently check/test only lsp-scaffold and skip lsp-engine
+      # entirely, where all the real logic lives. `--workspace` is required for
+      # this CI job to mean anything.
+      - name: cargo fmt --check
+        working-directory: src-tauri
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        working-directory: src-tauri
+        run: cargo clippy --workspace -- -D warnings
+
+      - name: cargo test
+        working-directory: src-tauri
+        run: cargo test --workspace
+
+  release:
+    name: Release (${{ matrix.os }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Restrict bundle targets explicitly: tauri.conf.json's "all" would
+          # also try `rpm` on Linux, which isn't installed on this runner and
+          # isn't one of the two formats §14 asks for.
+          - os: ubuntu-22.04
+            bundles: appimage,deb
+          - os: windows-latest
+            bundles: nsis
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ env.LINUX_DEPS }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build and publish release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Live Set Player ${{ github.ref_name }}"
+          releaseDraft: true
+          prerelease: false
+          args: --bundles ${{ matrix.bundles }}
