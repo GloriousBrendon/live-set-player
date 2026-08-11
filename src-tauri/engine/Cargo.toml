@@ -19,5 +19,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hound = "3"
 thiserror = "2"
+# Real-time layer (phase 2). cpal's optional `audio_thread_priority` feature is
+# deliberately NOT enabled: it would register the WASAPI callback thread with MMCSS
+# under the "Audio" task class, and a thread can only belong to one MMCSS task -- we
+# register "Pro Audio" (a higher scheduling category) ourselves in `device::mmcss`.
+cpal = "0.17"
+rtrb = "0.3"
+rubato = "0.16"
 
 [dev-dependencies]

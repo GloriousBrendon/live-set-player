@@ -14,14 +14,17 @@
 //! `tests/offline_render.rs`.
 
 use crate::click::{self, ClickSynthConfig};
-use crate::crossfade;
+use crate::core::{self, CoreBus, CoreClick, CoreTrack, PlaybackCore, SliceSequencer};
 use crate::error::RenderError;
-use crate::project::{Project, Song, Track};
-use crate::sections::{self, PerformanceEntry, ResolvedEntry};
+use crate::project::{Project, Song};
+use crate::sections::{self, PerformanceEntry};
+use crate::smoother::Smoother;
 use crate::timeline::Grid;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+
+pub use crate::core::db_to_linear;
 
 /// Preloaded, mono, project-rate audio per track id. Mirrors the real loader's output
 /// shape (`Arc<[f32]>` per track, per CLAUDE.md invariant 1 / §1) without doing any
@@ -137,10 +140,20 @@ impl RenderedAudio {
     }
 }
 
+/// Block size the offline renderer drives the core with. Any value would produce
+/// bit-identical output (the core is block-size invariant, and
+/// `tests/rt_equivalence.rs` proves it); 1024 mirrors the live path's typical device
+/// buffer.
+const OFFLINE_BLOCK_FRAMES: usize = 1024;
+
 /// Render `song` (from `project`) played in `order` to an interleaved stereo buffer.
 /// Bus 0 goes to the left channel, bus 1 to the right, regardless of how many buses
 /// `project.bus_layout` defines or what output channels they're mapped to -- §12 asks
 /// specifically for a two-channel monitoring render, not a full N-bus render.
+///
+/// Since phase 2 this drives the same [`PlaybackCore`] the real-time engine runs in
+/// the audio callback, in [`OFFLINE_BLOCK_FRAMES`] blocks: the offline render *is*
+/// the live signal path, headless.
 pub fn render_song(
     project: &Project,
     song: &Song,
@@ -157,41 +170,102 @@ pub fn render_song(
     let tail = opts.tail_samples as i64;
     let total_len = (lead_in + content_len + tail).max(0) as usize;
 
-    let mut bus_buffers: Vec<Vec<f32>> = (0..bus_count).map(|_| vec![0.0f32; total_len]).collect();
-
-    copy_track_audio(&mut bus_buffers, song, bank, &resolved, lead_in, bus_count)?;
-
-    for pair in resolved.windows(2) {
-        let (prev, next) = (&pair[0], &pair[1]);
-        if prev.source_end_sample == next.source_start_sample {
-            continue; // contiguous: a straight continuation, not a splice -- no fade.
-        }
-        apply_crossfade(
-            &mut bus_buffers,
-            &song.tracks,
-            bank,
-            prev,
-            next,
-            sample_rate,
-            lead_in,
-        )?;
+    let click_bus = project.click.bus;
+    if click_bus >= bus_count {
+        return Err(RenderError::BusIndexOutOfRange(click_bus, bus_count));
     }
 
-    render_click_into_buses(
-        &mut bus_buffers,
-        project,
-        song,
-        &resolved,
-        sample_rate,
-        lead_in,
-        bus_count,
-    )?;
+    let grid = Grid::new(sample_rate, song.bpm, song.time_signature)?;
 
-    let left = bus_buffers
+    let mut core_tracks = Vec::with_capacity(song.tracks.len());
+    for track in &song.tracks {
+        if track.bus >= bus_count {
+            return Err(RenderError::BusIndexOutOfRange(track.bus, bus_count));
+        }
+        let audio = bank
+            .get(&track.id)
+            .ok_or_else(|| RenderError::MissingTrack(track.id.clone()))?;
+        core_tracks.push(CoreTrack {
+            audio: audio.clone(),
+            bus: track.bus,
+            gain: Smoother::settled(db_to_linear(track.gain_db) as f32),
+            mute: Smoother::settled(if track.muted { 0.0 } else { 1.0 }),
+        });
+    }
+
+    let click = CoreClick {
+        pattern: click::effective_accent_pattern(&song.accent_pattern, grid.pulses_per_bar()),
+        cfg: ClickSynthConfig::default(),
+        bus: click_bus,
+        gain: Smoother::settled(db_to_linear(project.click.gain_db) as f32),
+    };
+    let buses: Vec<CoreBus> = if project.bus_layout.buses.is_empty() {
+        vec![CoreBus {
+            limiter_enabled: false,
+        }]
+    } else {
+        project
+            .bus_layout
+            .buses
+            .iter()
+            .map(|b| CoreBus {
+                limiter_enabled: b.limiter_enabled,
+            })
+            .collect()
+    };
+
+    let mut core = PlaybackCore::new(grid, song.offset_samples, core_tracks, click, buses);
+
+    let entries: Vec<core::Entry> = resolved
+        .iter()
+        .map(|r| {
+            let section = &song.sections[r.section_index];
+            let e = core::make_entry(
+                &grid,
+                song.offset_samples,
+                r.section_index,
+                (section.start_bar - 1) as i64,
+                r.perf_start_bar as i64,
+                r.length_bars,
+            );
+            debug_assert_eq!(e.perf_start_sample, r.perf_start_sample);
+            debug_assert_eq!(e.source_start_sample, r.source_start_sample);
+            debug_assert_eq!(e.source_end_sample, r.source_end_sample);
+            e
+        })
+        .collect();
+
+    let mut bus_out: Vec<Vec<f32>> = (0..bus_count).map(|_| vec![0.0f32; total_len]).collect();
+
+    if let Some(first) = entries.first() {
+        core.start(*first);
+        let mut seq = SliceSequencer::new(&entries);
+        // Render performance time [0, content + tail): the tail keeps the core
+        // running past the final entry so the last click hits' decay tails land in
+        // the output instead of being truncated.
+        let perf_total = content_len + tail;
+        let mut rendered = 0i64;
+        while rendered < perf_total {
+            let n = ((perf_total - rendered) as usize).min(OFFLINE_BLOCK_FRAMES);
+            core.render_block(n, &mut seq);
+            for (bus_idx, out) in bus_out.iter_mut().enumerate() {
+                let src = core.bus_buffer(bus_idx);
+                for (i, &s) in src.iter().enumerate().take(n) {
+                    let out_idx = lead_in + rendered + i as i64;
+                    if out_idx >= 0 && (out_idx as usize) < total_len {
+                        out[out_idx as usize] = s;
+                    }
+                }
+            }
+            rendered += n as i64;
+        }
+    }
+
+    let left = bus_out
         .first()
         .cloned()
         .unwrap_or_else(|| vec![0.0; total_len]);
-    let right = bus_buffers
+    let right = bus_out
         .get(1)
         .cloned()
         .unwrap_or_else(|| vec![0.0; total_len]);
@@ -206,156 +280,6 @@ pub fn render_song(
         channels: 2,
         interleaved,
     })
-}
-
-/// Sum every track's plain (un-crossfaded) audio into its bus across every resolved
-/// entry. Multiple tracks assigned to the same bus are additive (`+=`), per §4 "sum
-/// sources per bus." The crossfade pass below overwrites the boundary samples this
-/// step wrote wherever a splice needs blending.
-fn copy_track_audio(
-    bus_buffers: &mut [Vec<f32>],
-    song: &Song,
-    bank: &AudioBank,
-    resolved: &[ResolvedEntry],
-    lead_in: i64,
-    bus_count: usize,
-) -> Result<(), RenderError> {
-    for track in &song.tracks {
-        if track.muted {
-            continue;
-        }
-        if track.bus >= bus_count {
-            return Err(RenderError::BusIndexOutOfRange(track.bus, bus_count));
-        }
-        let audio = bank
-            .get(&track.id)
-            .ok_or_else(|| RenderError::MissingTrack(track.id.clone()))?;
-        let gain = db_to_linear(track.gain_db) as f32;
-        let buf = &mut bus_buffers[track.bus];
-
-        for entry in resolved {
-            let len = entry.perf_length_samples();
-            for i in 0..len {
-                let out_idx = entry.perf_start_sample + i + lead_in;
-                if out_idx < 0 {
-                    continue;
-                }
-                let out_idx = out_idx as usize;
-                if out_idx >= buf.len() {
-                    break;
-                }
-                let src_frame = entry.source_start_sample + i;
-                buf[out_idx] += read_track_sample(audio, src_frame) * gain;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Apply the 15 ms equal-power crossfade (§7) at one non-contiguous splice: for the
-/// fade window at the start of `next`, overwrite each affected bus with the blend of
-/// the outgoing track(s) (read past `prev`'s nominal end, "kept alive") and the
-/// incoming track(s) (read from `next`'s start). Buses fed by more than one track are
-/// summed *before* the fade weighting is applied per side, which is equivalent to
-/// applying the fade per track and summing after (the fade is a linear operation).
-fn apply_crossfade(
-    bus_buffers: &mut [Vec<f32>],
-    tracks: &[Track],
-    bank: &AudioBank,
-    prev: &ResolvedEntry,
-    next: &ResolvedEntry,
-    sample_rate: u32,
-    lead_in: i64,
-) -> Result<(), RenderError> {
-    let fade_len =
-        crossfade::crossfade_length_samples(sample_rate, Some(next.perf_length_samples()));
-    if fade_len <= 0 {
-        return Ok(());
-    }
-
-    for (bus_idx, bus_buf) in bus_buffers.iter_mut().enumerate() {
-        let mut sources: Vec<(&Arc<[f32]>, f32)> = Vec::new();
-        for t in tracks.iter().filter(|t| t.bus == bus_idx && !t.muted) {
-            let audio = bank
-                .get(&t.id)
-                .ok_or_else(|| RenderError::MissingTrack(t.id.clone()))?;
-            sources.push((audio, db_to_linear(t.gain_db) as f32));
-        }
-        if sources.is_empty() {
-            continue; // nothing on this bus reads from a track; the click bus lands here.
-        }
-
-        for i in 0..fade_len {
-            let (gain_out, gain_in) = crossfade::equal_power_gains(i as f64 / fade_len as f64);
-            let mut value = 0.0f32;
-            for (audio, gain) in &sources {
-                let out_frame = prev.source_end_sample + i;
-                let in_frame = next.source_start_sample + i;
-                value += gain_out * gain * read_track_sample(audio, out_frame);
-                value += gain_in * gain * read_track_sample(audio, in_frame);
-            }
-            let out_idx = next.perf_start_sample + i + lead_in;
-            if out_idx < 0 {
-                continue;
-            }
-            let out_idx = out_idx as usize;
-            if out_idx < bus_buf.len() {
-                bus_buf[out_idx] = value;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Generate the click across the whole (gapless, by construction) performance-time
-/// span covered by `resolved` and mix it additively into the configured click bus.
-fn render_click_into_buses(
-    bus_buffers: &mut [Vec<f32>],
-    project: &Project,
-    song: &Song,
-    resolved: &[ResolvedEntry],
-    sample_rate: u32,
-    lead_in: i64,
-    bus_count: usize,
-) -> Result<(), RenderError> {
-    let (first, last) = match (resolved.first(), resolved.last()) {
-        (Some(f), Some(l)) => (f, l),
-        _ => return Ok(()), // empty programme: nothing to click.
-    };
-    let click_bus = project.click.bus;
-    if click_bus >= bus_count {
-        return Err(RenderError::BusIndexOutOfRange(click_bus, bus_count));
-    }
-    let grid = Grid::new(sample_rate, song.bpm, song.time_signature)?;
-    let click_gain = db_to_linear(project.click.gain_db) as f32;
-
-    let total_len = bus_buffers[click_bus].len();
-    let mut click_buf = vec![0.0f32; total_len];
-    click::render_click_pulses(
-        &grid,
-        &song.accent_pattern,
-        first.perf_start_pulse,
-        last.perf_end_pulse,
-        &ClickSynthConfig::default(),
-        lead_in,
-        &mut click_buf,
-    );
-
-    for (dst, src) in bus_buffers[click_bus].iter_mut().zip(click_buf.iter()) {
-        *dst += *src * click_gain;
-    }
-    Ok(())
-}
-
-fn db_to_linear(db: f64) -> f64 {
-    10f64.powf(db / 20.0)
-}
-
-fn read_track_sample(audio: &Arc<[f32]>, frame: i64) -> f32 {
-    if frame < 0 {
-        return 0.0;
-    }
-    audio.get(frame as usize).copied().unwrap_or(0.0)
 }
 
 /// Write a rendered buffer to a 32-bit float WAV.
@@ -379,7 +303,7 @@ mod tests {
     use super::*;
     use crate::path::RelPath;
     use crate::project::{
-        AudioFileRef, Bus, BusLayout, ClickConfig, DownmixMode, Section, TrackKind,
+        AudioFileRef, Bus, BusLayout, ClickConfig, DownmixMode, Section, Track, TrackKind,
     };
     use crate::timeline::TimeSignature;
 

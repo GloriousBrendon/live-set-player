@@ -61,6 +61,47 @@ pub fn effective_accent_pattern(pattern: &[u8], pulses_per_bar: i64) -> Vec<u8> 
     default
 }
 
+/// Total length of one hit in samples: the envelope has decayed to exp(-5) (~0.7%)
+/// by `decay_ms`, and the hit runs 1.5x that so the truncated tail is inaudible.
+/// Shared by the offline and real-time paths so both agree on where a hit ends.
+pub fn hit_length_samples(sample_rate: u32, decay_ms: f64) -> i64 {
+    ((decay_ms / 1000.0) * 1.5 * sample_rate as f64).ceil() as i64
+}
+
+/// The value of one hit at sample `i` (0-based from the hit's start). This is *the*
+/// per-sample click formula: both the offline renderer and the real-time core call
+/// exactly this function, which is what makes their click output bit-identical no
+/// matter how a hit is split across processing blocks (the value depends only on
+/// `i`, never on any accumulated state).
+#[inline]
+pub fn hit_value(i: i64, sample_rate: u32, freq_hz: f64, gain: f32, decay_ms: f64) -> f32 {
+    // Time constant chosen so the envelope has decayed to exp(-5) (~0.7%) by decay_ms.
+    let tau_samples = decay_ms / 1000.0 * sample_rate as f64 / 5.0;
+    let t = i as f64;
+    let envelope = (-t / tau_samples).exp();
+    let phase = 2.0 * std::f64::consts::PI * freq_hz * t / sample_rate as f64;
+    (envelope * phase.cos()) as f32 * gain
+}
+
+/// Pick the (frequency, gain) for a pulse from the accent pattern. Any nonzero
+/// intensity gets the accent voice; out-of-range indices are unaccented (see
+/// [`effective_accent_pattern`] for why that must not panic).
+#[inline]
+pub fn pulse_voice(
+    pattern: &[u8],
+    pulses_per_bar: i64,
+    pulse: i64,
+    cfg: &ClickSynthConfig,
+) -> (f64, f32) {
+    let idx_in_bar = pulse.rem_euclid(pulses_per_bar) as usize;
+    let intensity = pattern.get(idx_in_bar).copied().unwrap_or(0);
+    if intensity > 0 {
+        (cfg.accent_freq_hz, cfg.accent_gain)
+    } else {
+        (cfg.base_freq_hz, cfg.base_gain)
+    }
+}
+
 /// Write one decaying cosine burst into `out`, added to whatever is already there
 /// (so multiple hits / bus contributions can be mixed by repeated calls). `start_sample`
 /// may be negative or beyond `out.len()`; samples outside `[0, out.len())` are simply
@@ -76,12 +117,7 @@ pub fn synthesize_hit(
     if gain == 0.0 || !freq_hz.is_finite() || freq_hz <= 0.0 {
         return;
     }
-    // Time constant chosen so the envelope has decayed to exp(-5) (~0.7%) by
-    // `decay_ms`; total hit length is 1.5x that so the tail is inaudible before it's
-    // truncated.
-    let tau_samples = decay_ms / 1000.0 * sample_rate as f64 / 5.0;
-    let hit_len = ((decay_ms / 1000.0) * 1.5 * sample_rate as f64).ceil() as i64;
-
+    let hit_len = hit_length_samples(sample_rate, decay_ms);
     for i in 0..hit_len {
         let idx = start_sample + i;
         if idx < 0 {
@@ -91,10 +127,7 @@ pub fn synthesize_hit(
         if idx >= out.len() {
             break;
         }
-        let t = i as f64;
-        let envelope = (-t / tau_samples).exp();
-        let phase = 2.0 * std::f64::consts::PI * freq_hz * t / sample_rate as f64;
-        out[idx] += (envelope * phase.cos()) as f32 * gain;
+        out[idx] += hit_value(i, sample_rate, freq_hz, gain, decay_ms);
     }
 }
 
@@ -123,13 +156,7 @@ pub fn render_click_pulses(
     }
 
     for pulse in start_pulse..end_pulse {
-        let idx_in_bar = pulse.rem_euclid(pulses_per_bar) as usize;
-        let intensity = pattern.get(idx_in_bar).copied().unwrap_or(0);
-        let (freq, gain) = if intensity > 0 {
-            (cfg.accent_freq_hz, cfg.accent_gain)
-        } else {
-            (cfg.base_freq_hz, cfg.base_gain)
-        };
+        let (freq, gain) = pulse_voice(&pattern, pulses_per_bar, pulse, cfg);
         let sample_pos = grid.pulse_to_sample(pulse) + sample_offset;
         synthesize_hit(
             out,

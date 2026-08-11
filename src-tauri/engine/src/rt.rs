@@ -1,0 +1,706 @@
+//! The real-time engine (`docs/SPEC.md` §3, §7): transport state machine, lock-free
+//! UI↔audio communication, and the headless `process` entry point the cpal callback
+//! (and the test suite) drives.
+//!
+//! Threading contract (CLAUDE.md invariant 1):
+//!
+//! - **UI → audio:** [`Command`]s over an `rtrb` SPSC queue.
+//! - **Audio → UI:** [`Status`] snapshots over a second `rtrb` queue, one per
+//!   `process` call, dropped when the queue is full (the UI polls at ~30 Hz and only
+//!   ever wants the latest).
+//! - **Freeing memory:** the audio thread never drops heap data. Replaced songs are
+//!   pushed whole (`Box<Loaded>`) onto a garbage queue and dropped by whoever owns
+//!   the [`GarbageDrain`] — a worker thread in the app, the test harness in tests.
+//!   If the garbage queue is momentarily full the box parks in a retry slot on the
+//!   engine and is re-offered next callback; it is never dropped in place.
+//! - `process` allocates nothing, locks nothing, and does no I/O. Enforced by the
+//!   counting-allocator test in `tests/rt_no_alloc.rs`.
+//!
+//! Transport semantics (§7 and the phase-2 scope):
+//!
+//! - Sections play in list order; `loopable` sections repeat until an advance or
+//!   seek is queued.
+//! - `AdvanceSection` / `SeekToSection` while playing quantise to the **next bar
+//!   boundary**: the active entry is truncated there (exact grid arithmetic, see
+//!   [`PlaybackCore::truncate_active_to_bar`]) and the queued target — visible in
+//!   every [`Status`] until it lands — takes over at the boundary, through the §7
+//!   crossfade when the splice is non-contiguous.
+//! - `SeekToSection` while stopped arms the section: the next `Play` starts a fresh
+//!   performance timeline there.
+//! - `Stop` ramps out over ~10 ms; `PanicStop` over ~5 ms (invariant 5: even panic
+//!   doesn't hard-cut, at gig timescales it is still immediate). Natural end of the
+//!   last section lets the final click hit's decay tail ring out, then stops.
+//!
+//! Starvation is defined behaviour: the transport advances by exactly the frames
+//! rendered and by nothing else, so skipped or late callbacks delay everything in
+//! wall time but can never shift the click against the backtrack or corrupt state.
+//! `tests/rt_equivalence.rs` pins this down.
+
+use crate::click::{self, ClickSynthConfig};
+use crate::core::{
+    self, db_to_linear, CoreBus, CoreClick, CoreTrack, Entry, PlaybackCore, Sequencer,
+    MAX_BLOCK_FRAMES,
+};
+use crate::error::RenderError;
+use crate::project::{Project, Song};
+use crate::render::AudioBank;
+use crate::smoother::{default_ramp_samples, Smoother};
+use crate::timeline::Grid;
+
+/// Stop ramp: 10 ms. Panic ramp: 5 ms. Both inside invariant 5's 5–10 ms window.
+const STOP_RAMP_MS: f64 = 10.0;
+const PANIC_RAMP_MS: f64 = 5.0;
+
+/// Everything the audio thread needs to play one song, fully allocated off-thread
+/// and handed over by `Box` through the command queue.
+pub struct Loaded {
+    pub core: PlaybackCore,
+    pub meta: SongMeta,
+}
+
+pub struct SongMeta {
+    pub grid: Grid,
+    /// Song offset, already scaled to the engine rate.
+    pub offset_samples: i64,
+    pub sections: Vec<SectionInfo>,
+    /// Output channel per bus (from the project's `BusLayout`).
+    pub bus_channels: Vec<u16>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SectionInfo {
+    pub source_start_bar0: i64,
+    pub length_bars: u32,
+    pub loopable: bool,
+}
+
+/// Scale a sample count from one rate to another (used for `offset_samples` when the
+/// engine rate differs from the project rate on Windows/WASAPI). Identity when the
+/// rates match.
+pub fn scale_samples(samples: i64, from_rate: u32, to_rate: u32) -> i64 {
+    if from_rate == to_rate {
+        samples
+    } else {
+        (samples as f64 * to_rate as f64 / from_rate as f64).round() as i64
+    }
+}
+
+/// Build a [`Loaded`] for `song`, with every allocation done here (worker/UI
+/// thread), never on the audio thread. `bank` must hold mono audio already
+/// resampled to `engine_rate` (the loader's job). Validation mirrors
+/// [`crate::render::render_song`].
+pub fn prepare_loaded(
+    project: &Project,
+    song: &Song,
+    bank: &AudioBank,
+    engine_rate: u32,
+) -> Result<Box<Loaded>, RenderError> {
+    let bus_count = project.bus_layout.buses.len().max(1);
+    let click_bus = project.click.bus;
+    if click_bus >= bus_count {
+        return Err(RenderError::BusIndexOutOfRange(click_bus, bus_count));
+    }
+    let grid = Grid::new(engine_rate, song.bpm, song.time_signature)?;
+    let offset_samples = scale_samples(song.offset_samples, project.sample_rate, engine_rate);
+
+    let mut tracks = Vec::with_capacity(song.tracks.len());
+    for track in &song.tracks {
+        if track.bus >= bus_count {
+            return Err(RenderError::BusIndexOutOfRange(track.bus, bus_count));
+        }
+        let audio = bank
+            .get(&track.id)
+            .ok_or_else(|| RenderError::MissingTrack(track.id.clone()))?;
+        tracks.push(CoreTrack {
+            audio: audio.clone(),
+            bus: track.bus,
+            gain: Smoother::settled(db_to_linear(track.gain_db) as f32),
+            mute: Smoother::settled(if track.muted { 0.0 } else { 1.0 }),
+        });
+    }
+
+    let click = CoreClick {
+        pattern: click::effective_accent_pattern(&song.accent_pattern, grid.pulses_per_bar()),
+        cfg: ClickSynthConfig::default(),
+        bus: click_bus,
+        gain: Smoother::settled(db_to_linear(project.click.gain_db) as f32),
+    };
+    let (buses, bus_channels): (Vec<CoreBus>, Vec<u16>) = if project.bus_layout.buses.is_empty() {
+        (
+            vec![CoreBus {
+                limiter_enabled: false,
+            }],
+            vec![0],
+        )
+    } else {
+        project
+            .bus_layout
+            .buses
+            .iter()
+            .map(|b| {
+                (
+                    CoreBus {
+                        limiter_enabled: b.limiter_enabled,
+                    },
+                    b.output_channel,
+                )
+            })
+            .unzip()
+    };
+
+    let core = PlaybackCore::new(grid, offset_samples, tracks, click, buses);
+    let sections = song
+        .sections
+        .iter()
+        .map(|s| SectionInfo {
+            source_start_bar0: (s.start_bar - 1) as i64,
+            length_bars: s.length_bars,
+            loopable: s.loopable,
+        })
+        .collect();
+
+    Ok(Box::new(Loaded {
+        core,
+        meta: SongMeta {
+            grid,
+            offset_samples,
+            sections,
+            bus_channels,
+        },
+    }))
+}
+
+/// UI → audio commands. Everything here is processed at the start of a `process`
+/// call, before any rendering, so command timing quantises to the block — and all
+/// musical timing (advance boundaries) quantises to the bar grid from there.
+pub enum Command {
+    Play,
+    Stop,
+    PanicStop,
+    /// While stopped: the next `Play` starts a fresh timeline at this section.
+    ArmSection(usize),
+    /// While playing: queued jump at the next bar boundary. While stopped: same as
+    /// `ArmSection`.
+    SeekToSection(usize),
+    /// Queued jump to the next section in list order at the next bar boundary (or a
+    /// stop at the boundary if the current section is the last).
+    AdvanceSection,
+    SetTrackGainDb {
+        track: usize,
+        db: f32,
+    },
+    SetTrackMuted {
+        track: usize,
+        muted: bool,
+    },
+    SetTrackBus {
+        track: usize,
+        bus: usize,
+    },
+    SetClickGainDb(f32),
+    SetLimiterEnabled {
+        bus: usize,
+        enabled: bool,
+    },
+    /// Swap in a new song (stops playback). The old song leaves via the garbage
+    /// queue, never dropped on the audio thread.
+    LoadSong(Box<Loaded>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportState {
+    Stopped,
+    Playing,
+    /// Stop/panic ramp in progress; silence and `Stopped` follow within 5–10 ms.
+    Stopping,
+}
+
+/// The queued-section indicator §7 requires the UI to show between an advance
+/// trigger and the bar boundary where it lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueuedStatus {
+    None,
+    Section(u32),
+    EndOfSong,
+}
+
+/// One audio→UI status snapshot. `Copy`, so it crosses the queue without touching
+/// the heap.
+#[derive(Debug, Clone, Copy)]
+pub struct Status {
+    pub state: TransportState,
+    /// Absolute performance-time sample position.
+    pub perf_sample: i64,
+    /// Index into the song's section list, -1 when nothing is active.
+    pub section: i32,
+    pub queued: QueuedStatus,
+    /// Whole bars left in the active entry (counts down; 1 during the final bar).
+    pub bars_remaining: u32,
+    pub engine_rate: u32,
+    pub song_loaded: bool,
+    /// Whether the callback thread is registered with MMCSS as "Pro Audio"
+    /// (Windows only; always false elsewhere and in headless use).
+    pub mmcss_pro_audio: bool,
+    /// Callback-observed over/underrun count. cpal does not report xruns directly;
+    /// this counts device-reported stream errors relayed by the error callback.
+    pub xruns: u32,
+    /// Total `process` invocations — a liveness counter: if this stops advancing
+    /// while a stream is open, the device callback has stalled or died.
+    pub callbacks: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Queued {
+    None,
+    Jump(usize),
+    End,
+}
+
+pub enum Garbage {
+    Loaded(Box<Loaded>),
+}
+
+/// Live-transport [`Sequencer`]: at each entry end, consume the queued jump if one
+/// landed, else loop a loopable section, else fall through to the next section in
+/// list order, else end. Pure arithmetic — allocation-free by construction.
+struct TransportSeq<'a> {
+    meta: &'a SongMeta,
+    queued: &'a mut Queued,
+}
+
+impl Sequencer for TransportSeq<'_> {
+    fn next_entry(&mut self, ended: &Entry) -> Option<Entry> {
+        let target = match std::mem::replace(self.queued, Queued::None) {
+            Queued::Jump(i) if i < self.meta.sections.len() => Some(i),
+            Queued::Jump(_) => None,
+            Queued::End => None,
+            Queued::None => {
+                if self
+                    .meta
+                    .sections
+                    .get(ended.section_index)
+                    .is_some_and(|s| s.loopable)
+                {
+                    Some(ended.section_index)
+                } else if ended.section_index + 1 < self.meta.sections.len() {
+                    Some(ended.section_index + 1)
+                } else {
+                    None
+                }
+            }
+        };
+        target.map(|idx| {
+            let s = &self.meta.sections[idx];
+            core::make_entry(
+                &self.meta.grid,
+                self.meta.offset_samples,
+                idx,
+                s.source_start_bar0,
+                ended.perf_start_bar + ended.length_bars as i64,
+                s.length_bars,
+            )
+        })
+    }
+}
+
+/// The audio-thread half of the engine. Owned by (moved into) the cpal data
+/// callback in live use; owned directly by tests in headless use.
+pub struct RtEngine {
+    cmd_rx: rtrb::Consumer<Command>,
+    status_tx: rtrb::Producer<Status>,
+    garbage_tx: rtrb::Producer<Garbage>,
+    /// Retry slot for a swapped-out song that couldn't enter the garbage queue —
+    /// parked here (no drop!) and re-offered every callback until it fits.
+    garbage_retry: Option<Garbage>,
+    loaded: Option<Box<Loaded>>,
+    state: TransportState,
+    queued: Queued,
+    armed_section: usize,
+    panic_pending: bool,
+    engine_rate: u32,
+    ramp_samples: u32,
+    stop_ramp_samples: u32,
+    panic_ramp_samples: u32,
+    register_mmcss: bool,
+    mmcss_attempted: bool,
+    mmcss_ok: bool,
+    xruns: u32,
+    callbacks: u32,
+}
+
+/// UI-thread handle: send commands, poll status.
+pub struct EngineHandle {
+    cmd_tx: rtrb::Producer<Command>,
+    status_rx: rtrb::Consumer<Status>,
+    last_status: Option<Status>,
+}
+
+impl EngineHandle {
+    /// Push a command; returns the command back if the queue is full (the caller
+    /// may retry — the audio thread drains every callback, so a full queue clears
+    /// within one buffer period).
+    pub fn send(&mut self, cmd: Command) -> Result<(), Command> {
+        self.cmd_tx.push(cmd).map_err(|rtrb::PushError::Full(c)| c)
+    }
+
+    /// Drain the status queue and return the most recent snapshot seen (sticky:
+    /// keeps returning the last one when no new snapshot has arrived).
+    pub fn latest_status(&mut self) -> Option<Status> {
+        while let Ok(s) = self.status_rx.pop() {
+            self.last_status = Some(s);
+        }
+        self.last_status
+    }
+}
+
+/// Owner of the garbage queue's consuming end; `drain` drops whatever the audio
+/// thread has discarded. Run it on a worker thread (or the test harness).
+pub struct GarbageDrain {
+    rx: rtrb::Consumer<Garbage>,
+}
+
+impl GarbageDrain {
+    /// Drop everything currently queued; returns how many items were freed.
+    pub fn drain(&mut self) -> usize {
+        let mut n = 0;
+        while self.rx.pop().is_ok() {
+            n += 1;
+        }
+        n
+    }
+}
+
+/// Build the engine triple. `register_mmcss` should be true only when the engine
+/// will run inside a real device callback (see [`crate::mmcss`]).
+pub fn new_engine(
+    engine_rate: u32,
+    register_mmcss: bool,
+) -> (RtEngine, EngineHandle, GarbageDrain) {
+    let (cmd_tx, cmd_rx) = rtrb::RingBuffer::new(256);
+    let (status_tx, status_rx) = rtrb::RingBuffer::new(64);
+    let (garbage_tx, garbage_rx) = rtrb::RingBuffer::new(16);
+    let engine = RtEngine {
+        cmd_rx,
+        status_tx,
+        garbage_tx,
+        garbage_retry: None,
+        loaded: None,
+        state: TransportState::Stopped,
+        queued: Queued::None,
+        armed_section: 0,
+        panic_pending: false,
+        engine_rate,
+        ramp_samples: default_ramp_samples(engine_rate),
+        stop_ramp_samples: (STOP_RAMP_MS / 1000.0 * engine_rate as f64).round() as u32,
+        panic_ramp_samples: (PANIC_RAMP_MS / 1000.0 * engine_rate as f64).round() as u32,
+        register_mmcss,
+        mmcss_attempted: false,
+        mmcss_ok: false,
+        xruns: 0,
+        callbacks: 0,
+    };
+    let handle = EngineHandle {
+        cmd_tx,
+        status_rx,
+        last_status: None,
+    };
+    (engine, handle, GarbageDrain { rx: garbage_rx })
+}
+
+impl RtEngine {
+    pub fn engine_rate(&self) -> u32 {
+        self.engine_rate
+    }
+
+    /// Record a device-reported stream error (called from the cpal error callback's
+    /// sibling state, relayed as a count).
+    pub fn note_xrun(&mut self) {
+        self.xruns = self.xruns.saturating_add(1);
+    }
+
+    /// Render `out.len() / channels` frames of interleaved output. This is the whole
+    /// audio callback: MMCSS registration on first entry (live only), command drain,
+    /// block rendering through the shared [`PlaybackCore`], bus→channel mapping,
+    /// one status push. No allocation, locks, I/O, or heap drops anywhere below.
+    pub fn process(&mut self, out: &mut [f32], channels: usize) {
+        self.callbacks = self.callbacks.wrapping_add(1);
+        if self.register_mmcss && !self.mmcss_attempted {
+            self.mmcss_attempted = true;
+            self.mmcss_ok = crate::mmcss::register_current_thread_pro_audio();
+        }
+        self.retry_garbage();
+        self.drain_commands();
+
+        out.fill(0.0);
+        if channels == 0 {
+            return;
+        }
+        let frames = out.len() / channels;
+
+        if matches!(
+            self.state,
+            TransportState::Playing | TransportState::Stopping
+        ) {
+            if let Some(loaded) = self.loaded.as_mut() {
+                let mut done = 0usize;
+                while done < frames {
+                    let n = (frames - done).min(MAX_BLOCK_FRAMES);
+                    {
+                        let Loaded { core, meta } = loaded.as_mut();
+                        let mut seq = TransportSeq {
+                            meta,
+                            queued: &mut self.queued,
+                        };
+                        core.render_block(n, &mut seq);
+                    }
+                    let core = &loaded.core;
+                    for bus in 0..core.bus_count() {
+                        let ch = loaded
+                            .meta
+                            .bus_channels
+                            .get(bus)
+                            .copied()
+                            .unwrap_or(u16::MAX) as usize;
+                        if ch >= channels {
+                            continue; // bus mapped past the device's channel count
+                        }
+                        let src = core.bus_buffer(bus);
+                        for (i, &s) in src.iter().enumerate().take(n) {
+                            out[(done + i) * channels + ch] += s;
+                        }
+                    }
+                    done += n;
+                }
+
+                // Post-render transport transitions.
+                match self.state {
+                    TransportState::Stopping => {
+                        if loaded.core.master_settled_at(0.0) {
+                            loaded.core.clear_active();
+                            self.queued = Queued::None;
+                            self.panic_pending = false;
+                            self.state = TransportState::Stopped;
+                        }
+                    }
+                    TransportState::Playing => {
+                        if loaded.core.active().is_none() {
+                            // Natural end: keep rendering until the final click
+                            // hit's decay tail has fully rung out, then stop. Exact
+                            // sample accounting, not block-granular — the offline
+                            // render's tail must not be truncated by callback size.
+                            let content_end = loaded
+                                .meta
+                                .grid
+                                .pulse_to_sample(loaded.core.schedule_end_pulse());
+                            if loaded.core.perf_pos() >= content_end + loaded.core.hit_length() {
+                                self.queued = Queued::None;
+                                self.state = TransportState::Stopped;
+                            }
+                        }
+                    }
+                    TransportState::Stopped => {}
+                }
+            } else {
+                self.state = TransportState::Stopped;
+            }
+        }
+
+        self.push_status();
+    }
+
+    fn drain_commands(&mut self) {
+        while let Ok(cmd) = self.cmd_rx.pop() {
+            self.apply_command(cmd);
+        }
+    }
+
+    fn apply_command(&mut self, cmd: Command) {
+        match cmd {
+            Command::Play => self.cmd_play(),
+            Command::Stop => {
+                if self.state == TransportState::Playing {
+                    if let Some(loaded) = self.loaded.as_mut() {
+                        loaded.core.set_master(0.0, self.stop_ramp_samples);
+                        self.state = TransportState::Stopping;
+                    }
+                }
+            }
+            Command::PanicStop => {
+                if matches!(
+                    self.state,
+                    TransportState::Playing | TransportState::Stopping
+                ) {
+                    if let Some(loaded) = self.loaded.as_mut() {
+                        loaded.core.set_master(0.0, self.panic_ramp_samples);
+                        self.queued = Queued::None;
+                        self.panic_pending = true;
+                        self.state = TransportState::Stopping;
+                    }
+                }
+            }
+            Command::ArmSection(i) => self.armed_section = i,
+            Command::SeekToSection(i) => {
+                if self.state == TransportState::Playing {
+                    self.queue_jump(Queued::Jump(i));
+                } else {
+                    self.armed_section = i;
+                }
+            }
+            Command::AdvanceSection => {
+                if self.state == TransportState::Playing {
+                    let target = self
+                        .loaded
+                        .as_ref()
+                        .and_then(|l| l.core.active())
+                        .map(|a| a.section_index + 1);
+                    if let (Some(t), Some(count)) =
+                        (target, self.loaded.as_ref().map(|l| l.meta.sections.len()))
+                    {
+                        let q = if t < count {
+                            Queued::Jump(t)
+                        } else {
+                            Queued::End
+                        };
+                        self.queue_jump(q);
+                    }
+                }
+            }
+            Command::SetTrackGainDb { track, db } => {
+                if let Some(l) = self.loaded.as_mut() {
+                    l.core
+                        .set_track_gain(track, db_to_linear(db as f64) as f32, self.ramp_samples);
+                }
+            }
+            Command::SetTrackMuted { track, muted } => {
+                if let Some(l) = self.loaded.as_mut() {
+                    l.core.set_track_muted(track, muted, self.ramp_samples);
+                }
+            }
+            Command::SetTrackBus { track, bus } => {
+                if let Some(l) = self.loaded.as_mut() {
+                    l.core.set_track_bus(track, bus);
+                }
+            }
+            Command::SetClickGainDb(db) => {
+                if let Some(l) = self.loaded.as_mut() {
+                    l.core
+                        .set_click_gain(db_to_linear(db as f64) as f32, self.ramp_samples);
+                }
+            }
+            Command::SetLimiterEnabled { bus, enabled } => {
+                if let Some(l) = self.loaded.as_mut() {
+                    l.core.set_limiter_enabled(bus, enabled);
+                }
+            }
+            Command::LoadSong(new) => {
+                let old = self.loaded.replace(new);
+                self.state = TransportState::Stopped;
+                self.queued = Queued::None;
+                self.armed_section = 0;
+                self.panic_pending = false;
+                if let Some(old) = old {
+                    self.discard(Garbage::Loaded(old));
+                }
+            }
+        }
+    }
+
+    fn cmd_play(&mut self) {
+        if self.state != TransportState::Stopped {
+            return;
+        }
+        let armed = self.armed_section;
+        let Some(loaded) = self.loaded.as_mut() else {
+            return;
+        };
+        let Some(section) = loaded.meta.sections.get(armed).copied() else {
+            return;
+        };
+        let first = core::make_entry(
+            &loaded.meta.grid,
+            loaded.meta.offset_samples,
+            armed,
+            section.source_start_bar0,
+            0,
+            section.length_bars,
+        );
+        // Instant master reset is a start from silence, not a live gain change —
+        // the one case invariant 5 permits a zero-length ramp.
+        loaded.core.set_master(1.0, 0);
+        loaded.core.start(first);
+        self.queued = Queued::None;
+        self.state = TransportState::Playing;
+    }
+
+    /// Queue a jump and truncate the active entry at the next bar boundary
+    /// (strictly after the current position). If the boundary falls at or past the
+    /// entry's natural end, the entry is left alone and the queued jump simply
+    /// takes over at that end — which is itself a bar boundary.
+    fn queue_jump(&mut self, q: Queued) {
+        let Some(loaded) = self.loaded.as_mut() else {
+            return;
+        };
+        if loaded.core.active().is_none() {
+            return;
+        }
+        let grid = loaded.meta.grid;
+        let ppb = grid.pulses_per_bar();
+        let current_pulse = grid.sample_to_pulse(loaded.core.perf_pos());
+        let boundary_bar = current_pulse.div_euclid(ppb) + 1;
+        loaded.core.truncate_active_to_bar(boundary_bar);
+        self.queued = q;
+    }
+
+    fn discard(&mut self, garbage: Garbage) {
+        debug_assert!(self.garbage_retry.is_none());
+        if let Err(rtrb::PushError::Full(g)) = self.garbage_tx.push(garbage) {
+            // Park it; never drop on the audio thread. Re-offered next callback.
+            self.garbage_retry = Some(g);
+        }
+    }
+
+    fn retry_garbage(&mut self) {
+        if let Some(g) = self.garbage_retry.take() {
+            if let Err(rtrb::PushError::Full(g)) = self.garbage_tx.push(g) {
+                self.garbage_retry = Some(g);
+            }
+        }
+    }
+
+    fn push_status(&mut self) {
+        let (section, bars_remaining, perf_sample, song_loaded) = match self.loaded.as_ref() {
+            Some(l) => {
+                let perf = l.core.perf_pos();
+                match l.core.active() {
+                    Some(a) => {
+                        let ppb = l.meta.grid.pulses_per_bar();
+                        let remaining_pulses =
+                            (a.perf_end_pulse - l.meta.grid.sample_to_pulse(perf)).max(0);
+                        let bars = ((remaining_pulses + ppb - 1) / ppb).max(0) as u32;
+                        (a.section_index as i32, bars, perf, true)
+                    }
+                    None => (-1, 0, perf, true),
+                }
+            }
+            None => (-1, 0, 0, false),
+        };
+        let queued = match self.queued {
+            Queued::None => QueuedStatus::None,
+            Queued::Jump(i) => QueuedStatus::Section(i as u32),
+            Queued::End => QueuedStatus::EndOfSong,
+        };
+        let status = Status {
+            state: self.state,
+            perf_sample,
+            section,
+            queued,
+            bars_remaining,
+            engine_rate: self.engine_rate,
+            song_loaded,
+            mmcss_pro_audio: self.mmcss_ok,
+            xruns: self.xruns,
+            callbacks: self.callbacks,
+        };
+        let _ = self.status_tx.push(status);
+    }
+}

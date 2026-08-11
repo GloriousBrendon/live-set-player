@@ -59,6 +59,50 @@ pub enum ProjectError {
     Validation(String),
 }
 
+/// Errors from the load-time audio pipeline (decode, downmix, resample).
+#[derive(Debug, Error)]
+pub enum LoadError {
+    #[error("I/O error reading '{path}': {source}")]
+    Io {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("WAV decode error in '{path}': {source}")]
+    Wav {
+        path: String,
+        #[source]
+        source: hound::Error,
+    },
+    #[error("unsupported WAV format in '{path}': {detail}")]
+    UnsupportedFormat { path: String, detail: String },
+    #[error("resampling failed: {0}")]
+    Resample(String),
+}
+
+/// Errors from the audio device layer (`docs/SPEC.md` §1).
+#[derive(Debug, Error)]
+pub enum DeviceError {
+    #[error("no output device configured; pick one in settings (never falls back to a default)")]
+    NoDeviceConfigured,
+    #[error("configured output device '{name}' not found; available: {available:?}")]
+    DeviceNotFound {
+        name: String,
+        available: Vec<String>,
+    },
+    #[error(
+        "device does not support the project sample rate {requested} Hz; supported rates: {supported:?}"
+    )]
+    UnsupportedRate {
+        requested: u32,
+        supported: Vec<(u32, u32)>,
+    },
+    #[error("device offers no output config with a supported sample format")]
+    NoUsableConfig,
+    #[error("audio backend error: {0}")]
+    Backend(String),
+}
+
 /// Errors from the offline renderer.
 #[derive(Debug, Error)]
 pub enum RenderError {
