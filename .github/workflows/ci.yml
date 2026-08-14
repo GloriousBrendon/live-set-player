@@ -145,17 +145,46 @@ jobs:
       # fails on any machine without the sidecar binary already staged, which is
       # every dev machine (the whole reason it's a CI-only build, docs/SPEC.md §8).
       # `jq` ships preinstalled on both GitHub-hosted runner images used here.
+      #
+      # `externalBin` only bundles the one named sidecar binary -- it does not
+      # sweep up the shared libraries verify-piper-sidecar proved piper-cli
+      # actually needs at runtime (src-tauri/binaries/README.md's "Runtime
+      # dependencies"), so those are added as `resources` here too, platform by
+      # platform. **Not yet verified**: whether Tauri's packaged resource
+      # directory is actually where the OS's dynamic loader looks relative to the
+      # sidecar binary inside a real bundle (AppImage/NSIS) -- confirmed so far is
+      # only that the binary runs when these sit beside it in a plain directory
+      # (the CI build tree), not that a `tauri build` bundle preserves that
+      # relationship. Verifying that needs an actual packaged build, which is
+      # phase-5 work (no frontend to bundle yet).
       - name: Wire the Piper sidecar into tauri.conf.json
         shell: bash
         working-directory: src-tauri
         run: |
           set -eu
-          jq '.bundle.externalBin = ["binaries/piper-cli"]
-              | .bundle.resources = {
-                  "resources/voices/": "resources/voices/",
-                  "resources/espeak-ng-data/": "resources/espeak-ng-data/",
-                  "resources/licenses/": "resources/licenses/"
-                }' tauri.conf.json > tauri.conf.json.tmp
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            sidecar_libs='{
+              "binaries/piper.dll": "piper.dll",
+              "binaries/onnxruntime.dll": "onnxruntime.dll",
+              "binaries/onnxruntime_providers_shared.dll": "onnxruntime_providers_shared.dll"
+            }'
+          else
+            sidecar_libs='{
+              "binaries/libpiper.so": "libpiper.so",
+              "binaries/libonnxruntime.so": "libonnxruntime.so",
+              "binaries/libonnxruntime.so.1": "libonnxruntime.so.1",
+              "binaries/libonnxruntime.so.1.22.0": "libonnxruntime.so.1.22.0",
+              "binaries/libonnxruntime_providers_shared.so": "libonnxruntime_providers_shared.so"
+            }'
+          fi
+          jq --argjson extra "$sidecar_libs" '
+            .bundle.externalBin = ["binaries/piper-cli"]
+            | .bundle.resources = ({
+                "resources/voices/": "resources/voices/",
+                "resources/espeak-ng-data/": "resources/espeak-ng-data/",
+                "resources/licenses/": "resources/licenses/"
+              } + $extra)
+          ' tauri.conf.json > tauri.conf.json.tmp
           mv tauri.conf.json.tmp tauri.conf.json
 
       - name: Build and publish release
@@ -230,7 +259,7 @@ jobs:
 
           {
             echo "## Render invocation"
-            echo "Flags: --model --config --output_file --length_scale --espeak_data (src-tauri/binaries/README.md's documented guess)"
+            echo "Flags: --model --config --output_file --length_scale --espeak_data (src-tauri/binaries/README.md's documented flags)"
             echo "Exit status: $status"
             echo '```'
             cat render_stdout.txt render_stderr.txt
