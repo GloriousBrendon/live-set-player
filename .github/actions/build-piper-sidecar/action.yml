@@ -53,16 +53,32 @@ runs:
     # - This is a real build, not a trivial one: it downloads a prebuilt
     #   onnxruntime release and builds espeak-ng from source via
     #   `ExternalProject_Add`, so budget real minutes for it, not seconds.
-    # - `cmake --install` (rather than fishing through the raw build tree) gives
-    #   a clean layout: `<prefix>/bin/piper_exe[.exe]` and
-    #   `<prefix>/espeak-ng-data/` (both installed explicitly by
-    #   libpiper/CMakeLists.txt).
+    # - `libpiper/CMakeLists.txt` installs the shared library with
+    #   `install(TARGETS piper DESTINATION ${CMAKE_INSTALL_PREFIX})` -- note: no
+    #   RUNTIME/LIBRARY/ARCHIVE keyword, and `${CMAKE_INSTALL_PREFIX}` is resolved
+    #   at *configure* time, not at `cmake --install --prefix` time. Left at its
+    #   default it resolves to `/usr/local` (Linux) or `C:/Program Files/...`
+    #   (Windows), and installing there without elevation fails with "Permission
+    #   denied" -- confirmed the hard way. Passing `-DCMAKE_INSTALL_PREFIX` at
+    #   *configure* time (not just `--install --prefix` at install time) is what
+    #   actually controls this rule.
+    # - `piper_exe` dynamically links `libpiper.so`/`piper.dll` -- it will not run
+    #   standing alone. The library lands directly at the install prefix root
+    #   (not under `bin/`, since that install rule has no RUNTIME subdirectory),
+    #   so it's copied next to the staged executable below: `$ORIGIN` rpath on
+    #   Linux (`patchelf`, already installed for Tauri's own AppImage bundling)
+    #   makes the exe find it there with no environment variable needed; Windows'
+    #   default DLL search order already checks the executable's own directory.
     - name: Build libpiper CLI
       shell: bash
       run: |
-        cmake -S piper1-gpl/libpiper -B piper1-gpl/build -DCMAKE_BUILD_TYPE=Release
+        set -eu
+        install_prefix="$PWD/piper1-gpl/install"
+        cmake -S piper1-gpl/libpiper -B piper1-gpl/build \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_INSTALL_PREFIX="$install_prefix"
         cmake --build piper1-gpl/build --config Release --target piper_exe
-        cmake --install piper1-gpl/build --config Release --prefix piper1-gpl/install
+        cmake --install piper1-gpl/build --config Release
 
     - name: Stage Piper sidecar binary and espeak-ng-data
       id: stage
@@ -71,14 +87,31 @@ runs:
         set -eu
         mkdir -p src-tauri/binaries src-tauri/resources
         suffix=""
-        if [ "${{ runner.os }}" = "Windows" ]; then suffix=".exe"; fi
+        libname="libpiper.so"
+        if [ "${{ runner.os }}" = "Windows" ]; then
+          suffix=".exe"
+          libname="piper.dll"
+        fi
         built="piper1-gpl/install/bin/piper_exe${suffix}"
         if [ ! -f "$built" ]; then
           echo "::error::$built not found after 'cmake --install' -- check libpiper/CMakeLists.txt's RUNTIME DESTINATION against the pinned commit" >&2
           exit 1
         fi
+        lib="piper1-gpl/install/${libname}"
+        if [ ! -f "$lib" ]; then
+          echo "::error::$lib not found after 'cmake --install' -- piper_exe dynamically links it and won't run without it; check libpiper/CMakeLists.txt's 'install(TARGETS piper ...)' rule against the pinned commit" >&2
+          exit 1
+        fi
         dest="src-tauri/binaries/piper-cli-${{ inputs.target-triple }}${suffix}"
         cp "$built" "$dest"
+        # The shared library sits next to the exe, not renamed -- Windows finds it
+        # there by default DLL search order; Linux needs an explicit rpath, since
+        # piper_exe's own build didn't set one (confirmed: "Set ... runtime path
+        # of piper_exe to ''" in the build log).
+        cp "$lib" "src-tauri/binaries/${libname}"
+        if [ "${{ runner.os }}" != "Windows" ]; then
+          patchelf --set-rpath '$ORIGIN' "$dest"
+        fi
         data_dir="piper1-gpl/install/espeak-ng-data"
         if [ ! -d "$data_dir" ]; then
           echo "::error::$data_dir not found after 'cmake --install' -- check libpiper/CMakeLists.txt's espeak-ng-data install rule against the pinned commit" >&2
