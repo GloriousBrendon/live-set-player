@@ -197,6 +197,12 @@ pub struct PlaybackCore {
     /// Whole-output gain, 1.0 in normal playback; ramped to 0 for stop/panic.
     master: Smoother,
     active: Option<Entry>,
+    /// Set by [`Self::start`] when a count-in precedes `active`'s natural start;
+    /// promoted to `active` once `perf_pos` reaches `perf_start_sample` (§6). While
+    /// this is set and `active` is `None`, `render_block` renders click-only —
+    /// `render_tracks_span` is never called, so the backtrack is silent by
+    /// construction, not by a special case.
+    pending: Option<Entry>,
     fade: FadeState,
     /// Absolute performance-time sample position; advances by exactly the number of
     /// frames rendered, and by nothing else.
@@ -235,6 +241,7 @@ impl PlaybackCore {
             click_scratch: vec![0.0; MAX_BLOCK_FRAMES],
             master: Smoother::settled(1.0),
             active: None,
+            pending: None,
             fade: FadeState::INACTIVE,
             perf_pos: 0,
             click_limit_pulse: 0,
@@ -256,6 +263,12 @@ impl PlaybackCore {
 
     pub fn active(&self) -> Option<&Entry> {
         self.active.as_ref()
+    }
+
+    /// The entry a count-in is counting into, `None` once it has landed (or if
+    /// playback wasn't started with a count-in at all). See [`Self::start`].
+    pub fn pending(&self) -> Option<&Entry> {
+        self.pending.as_ref()
     }
 
     pub fn hit_length(&self) -> i64 {
@@ -280,20 +293,39 @@ impl PlaybackCore {
         &self.bus_buf[bus]
     }
 
-    /// Begin playback at `first` (typically `perf_start_bar == 0`). Resets the
-    /// transport position and any leftover fade; does not touch parameter smoothers.
-    pub fn start(&mut self, first: Entry) {
+    /// Begin playback at `first` (typically `perf_start_bar == 0`), preceded by
+    /// `count_in_bars` bars of click-only count-in (§6). Resets the transport
+    /// position and any leftover fade; does not touch parameter smoothers.
+    ///
+    /// The count-in's start pulse is `first.perf_start_pulse - count_in_bars *
+    /// pulses_per_bar`, converted to a sample position the same
+    /// `round(pulse * samples_per_pulse)` way as every other pulse (never by
+    /// subtracting a sample count) — so it inherits the grid's exactness guarantee,
+    /// and stays correct for a mid-song rehearsal start where `first` doesn't begin
+    /// at pulse 0. With `count_in_bars == 0` this is exactly the old immediate start.
+    pub fn start(&mut self, first: Entry, count_in_bars: u32) {
         debug_assert!(first.perf_end_sample > first.perf_start_sample);
-        self.perf_pos = first.perf_start_sample;
         self.click_limit_pulse = first.perf_end_pulse;
         self.fade = FadeState::INACTIVE;
-        self.active = Some(first);
+        if count_in_bars == 0 {
+            self.perf_pos = first.perf_start_sample;
+            self.active = Some(first);
+            self.pending = None;
+        } else {
+            let count_in_pulses = count_in_bars as i64 * self.grid.pulses_per_bar();
+            self.perf_pos = self
+                .grid
+                .pulse_to_sample(first.perf_start_pulse - count_in_pulses);
+            self.active = None;
+            self.pending = Some(first);
+        }
     }
 
     /// Drop the active entry (panic stop / unload). No heap data is freed here —
     /// the `Entry` is `Copy` and the audio `Arc`s stay owned by the core.
     pub fn clear_active(&mut self) {
         self.active = None;
+        self.pending = None;
         self.fade = FadeState::INACTIVE;
     }
 
@@ -385,6 +417,18 @@ impl PlaybackCore {
 
         let mut done = 0usize;
         while done < frames {
+            // Promote a count-in's target entry once the transport reaches its start
+            // — the mirror image of the entry-boundary loop below, but for an
+            // entry's *start* rather than its end, so it belongs above that loop.
+            if self.active.is_none() {
+                if let Some(p) = self.pending {
+                    if self.perf_pos >= p.perf_start_sample {
+                        self.pending = None;
+                        self.active = Some(p);
+                    }
+                }
+            }
+
             // Resolve any entry boundary sitting exactly at the current position.
             while let Some(a) = self.active {
                 if self.perf_pos < a.perf_end_sample {
@@ -397,11 +441,19 @@ impl PlaybackCore {
             let n = match &self.active {
                 Some(a) => ((a.perf_end_sample - self.perf_pos).min((frames - done) as i64)).max(0)
                     as usize,
-                None => frames - done,
+                None => match &self.pending {
+                    // Still counting in: advance up to (never past) the target
+                    // entry's start, so the promotion above catches it exactly.
+                    Some(p) => ((p.perf_start_sample - self.perf_pos).min((frames - done) as i64))
+                        .max(0) as usize,
+                    None => frames - done,
+                },
             };
             if n == 0 {
                 // Defensive: only reachable if a sequencer hands back a zero-length
-                // entry, which `make_entry` cannot produce (length_bars >= 1).
+                // entry, which `make_entry` cannot produce (length_bars >= 1), or a
+                // count-in of zero bars, which `start` handles by activating `first`
+                // immediately rather than ever setting `pending`.
                 debug_assert!(false, "zero-length span in render_block");
                 break;
             }
@@ -473,7 +525,10 @@ impl PlaybackCore {
         // Candidate pulses: any whose hit window [pulse_sample, pulse_sample +
         // hit_len) can intersect the block. sample_to_pulse under-shoots by at most
         // one pulse either side; the per-pulse intersection test below is exact.
-        let lo = grid.sample_to_pulse(block_start - self.hit_len).max(0);
+        // No lower clamp at 0: count-in (§6) schedules pulses before performance-time
+        // 0, and Grid::pulse_to_sample/sample_to_pulse are exact for negative pulses
+        // by construction (see timeline.rs's negative-pulse tests).
+        let lo = grid.sample_to_pulse(block_start - self.hit_len);
         let hi = (grid.sample_to_pulse(block_end) + 1).min(self.click_limit_pulse);
         for pulse in lo..hi {
             let s = grid.pulse_to_sample(pulse);
@@ -666,7 +721,7 @@ mod tests {
             ],
         );
         let e = make_entry(&g, 2400, 0, 4, 0, 8);
-        core.start(e);
+        core.start(e, 0);
         assert!(core.truncate_active_to_bar(3));
         let a = *core.active().unwrap();
         assert_eq!(a.length_bars, 3);

@@ -190,6 +190,7 @@ fn offline_reference(song: &Song, order: &[PerformanceEntry], bank: &AudioBank) 
         &RenderOptions {
             lead_in_samples: 0,
             tail_samples: hit_len() as u64,
+            count_in_bars: 0,
         },
     )
     .unwrap();
@@ -226,6 +227,13 @@ fn live_loop_and_advance_matches_offline_render() {
     let offline = offline_reference(&song, &order, &bank);
 
     let (mut engine, mut handle, mut garbage) = rt::new_engine(RATE, false);
+    // These tests are about loop/advance/seek/starvation exactness, not
+    // count-in (that gets its own dedicated equivalence test below) — disable it
+    // so `Play` behaves exactly as it did before count-in existed.
+    handle
+        .send(Command::SetCountInOverride(Some(0)))
+        .ok()
+        .unwrap();
     let loaded = rt::prepare_loaded(&project(), &song, &bank, RATE).unwrap();
     // Perf bars: Intro 0-3, Verse 4-11, Chorus repeats 12-19 / 20-27 / 28-35,
     // Bridge 36-39. Advance during perf bar 35 (last bar of the third repeat).
@@ -277,6 +285,13 @@ fn live_mid_section_advance_truncates_at_bar_boundary() {
     let offline = offline_reference(&song_ref, &order, &bank);
 
     let (mut engine, mut handle, mut garbage) = rt::new_engine(RATE, false);
+    // These tests are about loop/advance/seek/starvation exactness, not
+    // count-in (that gets its own dedicated equivalence test below) — disable it
+    // so `Play` behaves exactly as it did before count-in existed.
+    handle
+        .send(Command::SetCountInOverride(Some(0)))
+        .ok()
+        .unwrap();
     let loaded = rt::prepare_loaded(&project(), &song, &bank, RATE).unwrap();
     // Live perf bars: Intro 0-3, Verse from bar 4; advance lands mid bar 5 (the
     // Verse's second bar) => boundary at perf bar 6, Verse truncated to 2 bars.
@@ -343,6 +358,13 @@ fn live_seek_matches_offline_render() {
     let offline = offline_reference(&song_ref, &order, &bank);
 
     let (mut engine, mut handle, mut garbage) = rt::new_engine(RATE, false);
+    // These tests are about loop/advance/seek/starvation exactness, not
+    // count-in (that gets its own dedicated equivalence test below) — disable it
+    // so `Play` behaves exactly as it did before count-in existed.
+    handle
+        .send(Command::SetCountInOverride(Some(0)))
+        .ok()
+        .unwrap();
     let loaded = rt::prepare_loaded(&project(), &song, &bank, RATE).unwrap();
     let seek_at = perf_bar_sample(1) + 2000; // inside Intro bar 2 => boundary at bar 2
     let mut commands = vec![
@@ -376,6 +398,13 @@ fn arm_section_then_play_starts_fresh_timeline_there() {
     let offline = offline_reference(&song, &order, &bank);
 
     let (mut engine, mut handle, mut garbage) = rt::new_engine(RATE, false);
+    // These tests are about loop/advance/seek/starvation exactness, not
+    // count-in (that gets its own dedicated equivalence test below) — disable it
+    // so `Play` behaves exactly as it did before count-in existed.
+    handle
+        .send(Command::SetCountInOverride(Some(0)))
+        .ok()
+        .unwrap();
     let loaded = rt::prepare_loaded(&project(), &song, &bank, RATE).unwrap();
     // Chorus spans perf bars 0-7 in the fresh timeline; advance during bar 7.
     let advance_at = perf_bar_sample(7) + 500;
@@ -395,6 +424,74 @@ fn arm_section_then_play_starts_fresh_timeline_there() {
     );
 
     assert_identical(&live, &offline, "armed-section start");
+    garbage.drain();
+}
+
+/// The count-in itself (§6) shifts the render's start position by a non-integer-
+/// samples-per-pulse amount — exactly the kind of seam where offline and live could
+/// silently diverge (wrong pending->active promotion, the click's negative-pulse
+/// clamp, block-size splitting across the count-in/downbeat boundary). Exercises both
+/// the per-song default (song `count_in_bars`) and the global override, at a
+/// non-default 2-bar count-in, and drives with an awkward block size so the
+/// count-in/downbeat seam isn't always landing on a block boundary.
+///
+/// Chorus's `loopable` flag is turned off for this fixture: the point of this test is
+/// the count-in seam, not loop-release semantics (already covered by
+/// `live_loop_and_advance_matches_offline_render`) — with it left on and no
+/// `AdvanceSection` ever sent, the live engine would (correctly, per §7) loop the
+/// Chorus again at its end while the offline reference's fixed `order` moves on to
+/// Bridge, a real but unrelated divergence this test isn't testing for.
+#[test]
+fn live_count_in_matches_offline_render() {
+    let mut song = four_section_song(2400);
+    song.sections[2].loopable = false;
+    let bank = bank_for(&song);
+    let count_in_bars = 2u32; // overrides the song's own count_in_bars (1)
+
+    let order = [
+        PerformanceEntry::once(0),
+        PerformanceEntry::once(1),
+        PerformanceEntry::once(2),
+        PerformanceEntry::once(3),
+    ];
+    let offline = {
+        let audio = render::render_song(
+            &project(),
+            &song,
+            &order,
+            &bank,
+            &RenderOptions {
+                lead_in_samples: 0,
+                tail_samples: hit_len() as u64,
+                count_in_bars,
+            },
+        )
+        .unwrap();
+        audio.interleaved
+    };
+
+    let (mut engine, mut handle, mut garbage) = rt::new_engine(RATE, false);
+    let loaded = rt::prepare_loaded(&project(), &song, &bank, RATE).unwrap();
+    let mut commands = vec![
+        (0usize, Command::SetCountInOverride(Some(count_in_bars))),
+        (0usize, Command::LoadSong(loaded)),
+        (0usize, Command::Play),
+    ];
+    let frames_total = offline.len() / 2;
+    let live = drive_engine(
+        &mut engine,
+        &mut handle,
+        frames_total,
+        &[733],
+        &mut commands,
+    );
+
+    assert_identical(&live, &offline, "count-in programme");
+    let status = handle.latest_status().unwrap();
+    assert_eq!(
+        status.count_in_beats_remaining, None,
+        "count-in must have cleared by the end of the render"
+    );
     garbage.drain();
 }
 
@@ -422,6 +519,13 @@ fn output_is_invariant_across_block_sizes() {
         vec![4096usize, 1, 257, 1024],
     ] {
         let (mut engine, mut handle, mut garbage) = rt::new_engine(RATE, false);
+        // These tests are about loop/advance/seek/starvation exactness, not
+        // count-in (that gets its own dedicated equivalence test below) — disable it
+        // so `Play` behaves exactly as it did before count-in existed.
+        handle
+            .send(Command::SetCountInOverride(Some(0)))
+            .ok()
+            .unwrap();
         let loaded = rt::prepare_loaded(&project(), &song, &bank, RATE).unwrap();
         let mut commands = vec![
             (0usize, Command::LoadSong(loaded)),
@@ -467,6 +571,13 @@ fn starved_and_bursty_callbacks_do_not_corrupt_transport() {
     // Reference: steady 1024-frame callbacks.
     let reference = {
         let (mut engine, mut handle, mut garbage) = rt::new_engine(RATE, false);
+        // These tests are about loop/advance/seek/starvation exactness, not
+        // count-in (that gets its own dedicated equivalence test below) — disable it
+        // so `Play` behaves exactly as it did before count-in existed.
+        handle
+            .send(Command::SetCountInOverride(Some(0)))
+            .ok()
+            .unwrap();
         let loaded = rt::prepare_loaded(&project(), &song, &bank, RATE).unwrap();
         let mut commands = vec![
             (0usize, Command::LoadSong(loaded)),
@@ -488,6 +599,13 @@ fn starved_and_bursty_callbacks_do_not_corrupt_transport() {
     // xrun the callback simply doesn't run), during which the advance command
     // arrives; then a catch-up burst of large and tiny callbacks.
     let (mut engine, mut handle, mut garbage) = rt::new_engine(RATE, false);
+    // These tests are about loop/advance/seek/starvation exactness, not
+    // count-in (that gets its own dedicated equivalence test below) — disable it
+    // so `Play` behaves exactly as it did before count-in existed.
+    handle
+        .send(Command::SetCountInOverride(Some(0)))
+        .ok()
+        .unwrap();
     let loaded = rt::prepare_loaded(&project(), &song, &bank, RATE).unwrap();
     handle.send(Command::LoadSong(loaded)).ok().unwrap();
     handle.send(Command::Play).ok().unwrap();
@@ -554,6 +672,13 @@ fn stop_and_panic_ramp_to_silence() {
         let song = four_section_song(0);
         let bank = bank_for(&song);
         let (mut engine, mut handle, mut garbage) = rt::new_engine(RATE, false);
+        // These tests are about loop/advance/seek/starvation exactness, not
+        // count-in (that gets its own dedicated equivalence test below) — disable it
+        // so `Play` behaves exactly as it did before count-in existed.
+        handle
+            .send(Command::SetCountInOverride(Some(0)))
+            .ok()
+            .unwrap();
         let loaded = rt::prepare_loaded(&project(), &song, &bank, RATE).unwrap();
         handle.send(Command::LoadSong(loaded)).ok().unwrap();
         handle.send(Command::Play).ok().unwrap();
@@ -591,6 +716,13 @@ fn loopable_section_loops_until_advanced() {
     let song = four_section_song(0);
     let bank = bank_for(&song);
     let (mut engine, mut handle, mut garbage) = rt::new_engine(RATE, false);
+    // These tests are about loop/advance/seek/starvation exactness, not
+    // count-in (that gets its own dedicated equivalence test below) — disable it
+    // so `Play` behaves exactly as it did before count-in existed.
+    handle
+        .send(Command::SetCountInOverride(Some(0)))
+        .ok()
+        .unwrap();
     let loaded = rt::prepare_loaded(&project(), &song, &bank, RATE).unwrap();
     let mut commands = vec![
         (0usize, Command::LoadSong(loaded)),

@@ -268,6 +268,7 @@ fn ten_minute_render_final_transient_is_exact() {
     let opts = RenderOptions {
         lead_in_samples: 0,
         tail_samples: sample_rate as u64, // headroom for the last click's decay tail
+        count_in_bars: 0,
     };
     let audio = render::render_song(&proj, &song, &order, &bank, &opts).unwrap();
 
@@ -506,4 +507,103 @@ fn contiguous_boundaries_get_no_crossfade() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------------
+// 4. Count-in (§6)
+// ---------------------------------------------------------------------------------
+
+/// Count-in in 7/8 with a real accent pattern: every click before the downbeat lands
+/// on the exact negative-pulse sample the grid predicts, respects the same
+/// bar-relative accent pattern the rest of the song uses (a count-in bar accents its
+/// own beat 1 the same way any other bar would), the backtrack stays silent for the
+/// *entire* count-in region -- checked with `ramp_stub`, not a silent stub, and with
+/// the section's source start pushed well past the count-in's length in samples, so a
+/// leaked track read during count-in would decode to a wrong nonzero frame instead of
+/// coincidentally matching silence -- and the backtrack picks up at exactly the right
+/// source frame the instant the downbeat lands.
+#[test]
+fn count_in_is_click_only_and_respects_the_accent_pattern_in_7_8() {
+    let sample_rate = 48000u32;
+    let bpm = 178.0;
+    let ts = TimeSignature {
+        numerator: 7,
+        denominator: 8,
+    };
+    let accent_pattern = vec![2, 0, 0, 1, 0, 0, 0];
+    let proj = project(sample_rate);
+    let mut song = single_section_song(bpm, ts, 4, accent_pattern.clone());
+    // Push the section's source start well past the count-in's length in samples, so
+    // an accidental track read during count-in (the bug this test guards against)
+    // would decode to a wrong nonzero source frame rather than silently reading as
+    // "before frame 0" silence.
+    song.sections[0].start_bar = 20;
+    let count_in_bars = 1u32;
+
+    let grid = Grid::new(sample_rate, bpm, ts).unwrap();
+    let mut bank = AudioBank::new();
+    bank.insert(
+        "bt",
+        render::ramp_stub(grid.bar_beat_to_sample(40, 0) as usize),
+    );
+    let order = [PerformanceEntry::once(0)];
+    let opts = RenderOptions {
+        lead_in_samples: 0,
+        tail_samples: 0,
+        count_in_bars,
+    };
+    let audio = render::render_song(&proj, &song, &order, &bank, &opts).unwrap();
+
+    let ppb = grid.pulses_per_bar(); // 7
+    let count_in_pulses = count_in_bars as i64 * ppb;
+    let count_in_samples = grid.pulse_to_sample(count_in_pulses);
+    let default_cfg = lsp_engine::click::ClickSynthConfig::default();
+
+    // Every count-in click lands exactly where the grid predicts and carries the
+    // correct accent for its position within the bar.
+    for pulse in -count_in_pulses..0 {
+        let out_idx = (grid.pulse_to_sample(pulse) + count_in_samples) as usize;
+        assert_eq!(
+            peak_index_in_window(&audio, out_idx, 50),
+            out_idx,
+            "count-in pulse {pulse} transient"
+        );
+        let idx_in_bar = pulse.rem_euclid(ppb) as usize;
+        let expected_gain = if accent_pattern[idx_in_bar] > 0 {
+            default_cfg.accent_gain
+        } else {
+            default_cfg.base_gain
+        };
+        assert!(
+            (right(&audio, out_idx).abs() - expected_gain).abs() < 1e-5,
+            "count-in pulse {pulse} (bar-position {idx_in_bar}): expected peak magnitude \
+             {expected_gain}, got {}",
+            right(&audio, out_idx).abs()
+        );
+    }
+
+    // Backtrack silent through the entire count-in region, not just at click samples.
+    for frame in 0..count_in_samples as usize {
+        assert_eq!(
+            left(&audio, frame),
+            0.0,
+            "backtrack must stay silent during count-in (frame {frame})"
+        );
+    }
+
+    // The downbeat lands exactly at count_in_samples, is accented (beat 1), and the
+    // backtrack becomes live there, reading from the section's true source start.
+    let downbeat_idx = count_in_samples as usize;
+    assert_eq!(peak_index_in_window(&audio, downbeat_idx, 50), downbeat_idx);
+    assert!(
+        (right(&audio, downbeat_idx).abs() - default_cfg.accent_gain).abs() < 1e-5,
+        "downbeat must be accented"
+    );
+    let expected_source_start =
+        grid.pulse_to_sample(grid.bar_to_pulse((song.sections[0].start_bar - 1) as i64));
+    assert_eq!(
+        render::decode_ramp_sample(left(&audio, downbeat_idx)),
+        expected_source_start,
+        "backtrack must pick up at the section's true source start exactly at the downbeat"
+    );
 }

@@ -27,6 +27,10 @@
 //!   crossfade when the splice is non-contiguous.
 //! - `SeekToSection` while stopped arms the section: the next `Play` starts a fresh
 //!   performance timeline there.
+//! - `Play` from `Stopped` is preceded by a click-only count-in (§6) whenever the
+//!   armed section's or the global override's count-in length is nonzero — this
+//!   applies identically whether the armed section is bar 1 or a mid-song rehearsal
+//!   point. See [`PlaybackCore::start`] and [`Command::SetCountInOverride`].
 //! - `Stop` ramps out over ~10 ms; `PanicStop` over ~5 ms (invariant 5: even panic
 //!   doesn't hard-cut, at gig timescales it is still immediate). Natural end of the
 //!   last section lets the final click hit's decay tail ring out, then stops.
@@ -65,6 +69,9 @@ pub struct SongMeta {
     pub sections: Vec<SectionInfo>,
     /// Output channel per bus (from the project's `BusLayout`).
     pub bus_channels: Vec<u16>,
+    /// This song's own count-in length (§6), already clamped to 0-4 bars. Used by
+    /// `cmd_play` unless overridden — see [`Command::SetCountInOverride`].
+    pub count_in_bars: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -166,6 +173,7 @@ pub fn prepare_loaded(
             offset_samples,
             sections,
             bus_channels,
+            count_in_bars: song.count_in_bars.min(4),
         },
     }))
 }
@@ -202,6 +210,12 @@ pub enum Command {
         bus: usize,
         enabled: bool,
     },
+    /// Global count-in override (§6: "configurable ... overridable globally"):
+    /// `None` uses each song's own `count_in_bars` (the default); `Some(n)` (clamped
+    /// 0-4) overrides every subsequent `Play` regardless of song, until changed
+    /// again. Persistent engine state, not a per-`Play` parameter, so a UI toggle
+    /// (e.g. "rehearsal: no count-in") only needs to be set once.
+    SetCountInOverride(Option<u32>),
     /// Swap in a new song (stops playback). The old song leaves via the garbage
     /// queue, never dropped on the audio thread.
     LoadSong(Box<Loaded>),
@@ -236,6 +250,11 @@ pub struct Status {
     pub queued: QueuedStatus,
     /// Whole bars left in the active entry (counts down; 1 during the final bar).
     pub bars_remaining: u32,
+    /// Pulses remaining until the count-in's target downbeat (§6); `Some`,
+    /// decrementing to 0, only while a count-in is in progress, `None` otherwise
+    /// (including once playback has started). The performance view's count-in
+    /// indicator.
+    pub count_in_beats_remaining: Option<u32>,
     pub engine_rate: u32,
     pub song_loaded: bool,
     /// Whether the callback thread is registered with MMCSS as "Pro Audio"
@@ -317,6 +336,8 @@ pub struct RtEngine {
     queued: Queued,
     armed_section: usize,
     panic_pending: bool,
+    /// See [`Command::SetCountInOverride`].
+    count_in_override: Option<u32>,
     engine_rate: u32,
     ramp_samples: u32,
     stop_ramp_samples: u32,
@@ -389,6 +410,7 @@ pub fn new_engine(
         queued: Queued::None,
         armed_section: 0,
         panic_pending: false,
+        count_in_override: None,
         engine_rate,
         ramp_samples: default_ramp_samples(engine_rate),
         stop_ramp_samples: (STOP_RAMP_MS / 1000.0 * engine_rate as f64).round() as u32,
@@ -483,7 +505,12 @@ impl RtEngine {
                         }
                     }
                     TransportState::Playing => {
-                        if loaded.core.active().is_none() {
+                        // `active` is also `None` while a count-in is in progress
+                        // (see `PlaybackCore::start`/`pending`) — without the
+                        // `pending().is_none()` check here, the transport would
+                        // mistake "counting in" for "song has ended" and stop itself
+                        // the instant Play is pressed.
+                        if loaded.core.active().is_none() && loaded.core.pending().is_none() {
                             // Natural end: keep rendering until the final click
                             // hit's decay tail has fully rung out, then stop. Exact
                             // sample accounting, not block-granular — the offline
@@ -592,6 +619,9 @@ impl RtEngine {
                     l.core.set_limiter_enabled(bus, enabled);
                 }
             }
+            Command::SetCountInOverride(bars) => {
+                self.count_in_override = bars.map(|b| b.min(4));
+            }
             Command::LoadSong(new) => {
                 let old = self.loaded.replace(new);
                 self.state = TransportState::Stopped;
@@ -624,10 +654,17 @@ impl RtEngine {
             0,
             section.length_bars,
         );
+        // §6: count-in applies whichever section is armed (this generic "any armed
+        // section" path is also how a mid-song rehearsal start works), and the
+        // global override (if set) takes precedence over the song's own default.
+        let count_in_bars = self
+            .count_in_override
+            .unwrap_or(loaded.meta.count_in_bars)
+            .min(4);
         // Instant master reset is a start from silence, not a live gain change —
         // the one case invariant 5 permits a zero-length ramp.
         loaded.core.set_master(1.0, 0);
-        loaded.core.start(first);
+        loaded.core.start(first, count_in_bars);
         self.queued = Queued::None;
         self.state = TransportState::Playing;
     }
@@ -684,6 +721,15 @@ impl RtEngine {
             }
             None => (-1, 0, 0, false),
         };
+        // §6: pulses remaining until the count-in's target downbeat, read from the
+        // grid (never a separately-maintained counter) so it can't drift from the
+        // click that's actually sounding.
+        let count_in_beats_remaining = self.loaded.as_ref().and_then(|l| {
+            l.core.pending().map(|p| {
+                let current_pulse = l.meta.grid.sample_to_pulse(l.core.perf_pos());
+                (p.perf_start_pulse - current_pulse).max(0) as u32
+            })
+        });
         let queued = match self.queued {
             Queued::None => QueuedStatus::None,
             Queued::Jump(i) => QueuedStatus::Section(i as u32),
@@ -695,6 +741,7 @@ impl RtEngine {
             section,
             queued,
             bars_remaining,
+            count_in_beats_remaining,
             engine_rate: self.engine_rate,
             song_loaded,
             mmcss_pro_audio: self.mmcss_ok,

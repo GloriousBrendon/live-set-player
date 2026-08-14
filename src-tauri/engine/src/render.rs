@@ -120,6 +120,10 @@ pub struct RenderOptions {
     /// final click hit's decay tail (and any crossfade reading past the nominal end)
     /// isn't truncated.
     pub tail_samples: u64,
+    /// Bars of click-only count-in (§6) to render before the first entry's downbeat.
+    /// Default 0 (no count-in — the render starts exactly at performance bar 0, the
+    /// pre-count-in behaviour). Clamped to 0-4 per §6's stated range.
+    pub count_in_bars: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -168,7 +172,6 @@ pub fn render_song(
     let content_len = sections::total_length_samples(&resolved);
     let lead_in = opts.lead_in_samples as i64;
     let tail = opts.tail_samples as i64;
-    let total_len = (lead_in + content_len + tail).max(0) as usize;
 
     let click_bus = project.click.bus;
     if click_bus >= bus_count {
@@ -176,6 +179,13 @@ pub fn render_song(
     }
 
     let grid = Grid::new(sample_rate, song.bpm, song.time_signature)?;
+    let count_in_bars = opts.count_in_bars.min(4);
+    // Symmetric with `PlaybackCore::start`'s count-in start pulse
+    // (`first.perf_start_pulse - count_in_pulses`): entries[0] always starts at
+    // perf pulse 0 (resolve_order's cursor starts at 0), so this is exactly
+    // `-core.perf_pos()` right after `start`.
+    let count_in_samples = grid.pulse_to_sample(count_in_bars as i64 * grid.pulses_per_bar());
+    let total_len = (lead_in + count_in_samples + content_len + tail).max(0) as usize;
 
     let mut core_tracks = Vec::with_capacity(song.tracks.len());
     for track in &song.tracks {
@@ -238,12 +248,13 @@ pub fn render_song(
     let mut bus_out: Vec<Vec<f32>> = (0..bus_count).map(|_| vec![0.0f32; total_len]).collect();
 
     if let Some(first) = entries.first() {
-        core.start(*first);
+        core.start(*first, count_in_bars);
         let mut seq = SliceSequencer::new(&entries);
-        // Render performance time [0, content + tail): the tail keeps the core
-        // running past the final entry so the last click hits' decay tails land in
-        // the output instead of being truncated.
-        let perf_total = content_len + tail;
+        // Render performance time [-count_in, content + tail): the tail keeps the
+        // core running past the final entry so the last click hits' decay tails land
+        // in the output instead of being truncated; the count-in extends the start
+        // symmetrically backwards, `rendered` counting up from that earlier origin.
+        let perf_total = count_in_samples + content_len + tail;
         let mut rendered = 0i64;
         while rendered < perf_total {
             let n = ((perf_total - rendered) as usize).min(OFFLINE_BLOCK_FRAMES);
@@ -406,6 +417,7 @@ mod tests {
         let opts = RenderOptions {
             lead_in_samples: 1000,
             tail_samples: 0,
+            count_in_bars: 0,
         };
         let audio = render_song(&project, &song, &order, &bank, &opts).unwrap();
         // No click transient before sample 1000 (bar 1 beat 1 accent lands at 1000).

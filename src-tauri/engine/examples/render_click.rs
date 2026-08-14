@@ -13,6 +13,8 @@
 //!   --lead-in N        Samples of silence before performance sample 0 (default 0).
 //!                       Pass a song's offset_samples to align the render with an
 //!                       untrimmed source backtrack at 0:00 in a DAW.
+//!   --count-in N        Bars of click-only count-in before the downbeat (§6),
+//!                       0-4 (default 0).
 //!   --stub MODE         silent (default) | ramp | tones -- what the backtrack track
 //!                       contains. `ramp`/`tones` are for eyeballing/listening to
 //!                       section placement, not for the click-grid check.
@@ -39,6 +41,7 @@ struct Args {
     time_sig: TimeSignature,
     minutes: f64,
     lead_in: u64,
+    count_in: u32,
     out: PathBuf,
     stub: StubMode,
     order: Option<Vec<usize>>,
@@ -54,7 +57,7 @@ enum StubMode {
 fn print_usage() {
     eprintln!(
         "Usage: render_click --bpm F --sample-rate N --time-sig N/N --minutes F --out PATH \
-         [--lead-in N] [--stub silent|ramp|tones] [--order 2,1,2,3,0]"
+         [--lead-in N] [--count-in N] [--stub silent|ramp|tones] [--order 2,1,2,3,0]"
     );
 }
 
@@ -64,6 +67,7 @@ fn parse_args() -> Result<Args, String> {
     let mut time_sig = TimeSignature::FOUR_FOUR;
     let mut minutes = 10.0;
     let mut lead_in = 0u64;
+    let mut count_in = 0u32;
     let mut out = PathBuf::from("click.wav");
     let mut stub = StubMode::Silent;
     let mut order: Option<Vec<usize>> = None;
@@ -95,6 +99,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--minutes" => minutes = next()?.parse().map_err(|e| format!("--minutes: {e}"))?,
             "--lead-in" => lead_in = next()?.parse().map_err(|e| format!("--lead-in: {e}"))?,
+            "--count-in" => count_in = next()?.parse().map_err(|e| format!("--count-in: {e}"))?,
             "--out" => out = PathBuf::from(next()?),
             "--stub" => {
                 stub = match next()?.as_str() {
@@ -126,6 +131,7 @@ fn parse_args() -> Result<Args, String> {
         time_sig,
         minutes,
         lead_in,
+        count_in,
         out,
         stub,
         order,
@@ -283,6 +289,7 @@ fn main() {
             * 1.5
             * args.sample_rate as f64)
             .ceil() as u64,
+        count_in_bars: args.count_in,
     };
 
     let audio = match render::render_song(&project, &song, &order, &bank, &opts) {

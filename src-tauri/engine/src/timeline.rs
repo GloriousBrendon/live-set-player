@@ -477,6 +477,29 @@ mod tests {
         }
     }
 
+    /// Same guarantee as [`sample_to_bar_beat_round_trips_exactly`], extended to
+    /// negative pulses -- the range count-in (`docs/SPEC.md` §6) schedules into.
+    /// `sample_to_bar_beat` decomposes into a non-negative `pulse_in_bar` via
+    /// `rem_euclid`, so this checks the round trip through `sample_to_pulse` directly
+    /// instead, which is the primitive count-in status reporting depends on.
+    #[test]
+    fn sample_to_pulse_round_trips_exactly_for_negative_pulses() {
+        for &sample_rate in &TEST_SAMPLE_RATES {
+            for &(_, _, bpm) in &TEST_BPMS {
+                let grid = Grid::new(sample_rate, bpm, TimeSignature::FOUR_FOUR).unwrap();
+                for pulse in -32i64..0 {
+                    let sample = grid.pulse_to_sample(pulse);
+                    let got = grid.sample_to_pulse(sample);
+                    assert_eq!(
+                        got, pulse,
+                        "bpm {bpm} / {sample_rate} Hz: pulse {pulse} (sample {sample}) did \
+                         not round-trip"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn source_map_applies_offset_only_at_source_mapping() {
         let grid = Grid::new(48000, 178.0, TimeSignature::FOUR_FOUR).unwrap();

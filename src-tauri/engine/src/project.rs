@@ -156,6 +156,12 @@ impl Song {
                 self.bpm
             )));
         }
+        if self.count_in_bars > 4 {
+            return Err(ProjectError::Validation(format!(
+                "count_in_bars must be 0-4, got {}",
+                self.count_in_bars
+            )));
+        }
         if !self.accent_pattern.is_empty()
             && self.accent_pattern.len() != self.time_signature.numerator as usize
         {
@@ -490,6 +496,14 @@ mod tests {
     fn validate_catches_wrong_length_accent_pattern() {
         let mut json = minimal_project_json();
         json["songs"][0]["accent_pattern"] = serde_json::json!([2, 0, 0]); // 4/4 needs 4
+        let project = load_project_json(&json.to_string()).unwrap();
+        assert!(project.validate().is_err());
+    }
+
+    #[test]
+    fn validate_catches_out_of_range_count_in_bars() {
+        let mut json = minimal_project_json();
+        json["songs"][0]["count_in_bars"] = serde_json::json!(5); // §6 range is 0-4
         let project = load_project_json(&json.to_string()).unwrap();
         assert!(project.validate().is_err());
     }
