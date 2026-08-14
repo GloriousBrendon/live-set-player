@@ -1,0 +1,93 @@
+name: Build Piper sidecar
+description: >
+  Builds the libpiper CLI from the pinned OHF-Voice/piper1-gpl commit, stages it
+  (plus espeak-ng-data) into src-tauri/binaries and src-tauri/resources, and fetches
+  the bundled default voice model. Shared by the release job and the
+  verify-piper-sidecar workflow_dispatch job (ci.yml) so there is exactly one place
+  to correct the CMake target name / build layout, not two copies to keep in sync.
+
+inputs:
+  target-triple:
+    description: Rust target triple used for the sidecar binary's filename suffix.
+    required: true
+  piper-commit:
+    description: Pinned OHF-Voice/piper1-gpl commit to build.
+    required: true
+
+outputs:
+  binary-path:
+    description: Path to the staged Piper CLI binary.
+    value: ${{ steps.stage.outputs.binary-path }}
+  voice-onnx-path:
+    description: Path to the fetched default voice .onnx file.
+    value: ${{ steps.voice.outputs.onnx-path }}
+  voice-config-path:
+    description: Path to the fetched default voice .onnx.json file.
+    value: ${{ steps.voice.outputs.config-path }}
+  espeak-data-path:
+    description: Path to the staged espeak-ng-data directory.
+    value: ${{ steps.stage.outputs.espeak-data-path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout piper1-gpl (pinned)
+      uses: actions/checkout@v4
+      with:
+        repository: OHF-Voice/piper1-gpl
+        ref: ${{ inputs.piper-commit }}
+        path: piper1-gpl
+
+    # NOT YET VERIFIED beyond whatever the last verify-piper-sidecar workflow_dispatch
+    # run confirmed -- see src-tauri/binaries/README.md for the current status.
+    - name: Build libpiper CLI
+      shell: bash
+      run: |
+        cmake -S piper1-gpl -B piper1-gpl/build -DCMAKE_BUILD_TYPE=Release
+        cmake --build piper1-gpl/build --config Release --target piper
+
+    - name: Stage Piper sidecar binary and espeak-ng-data
+      id: stage
+      shell: bash
+      run: |
+        set -eu
+        mkdir -p src-tauri/binaries src-tauri/resources
+        suffix=""
+        if [ "${{ runner.os }}" = "Windows" ]; then suffix=".exe"; fi
+        built=$(find piper1-gpl/build -maxdepth 4 -iname "piper${suffix}" -type f | head -n1)
+        if [ -z "$built" ]; then
+          echo "::error::libpiper CLI executable not found under piper1-gpl/build -- check the CMake target name against the pinned commit" >&2
+          exit 1
+        fi
+        dest="src-tauri/binaries/piper-cli-${{ inputs.target-triple }}${suffix}"
+        cp "$built" "$dest"
+        data_dir=$(find piper1-gpl/build piper1-gpl -maxdepth 4 -iname "espeak-ng-data" -type d | head -n1)
+        if [ -z "$data_dir" ]; then
+          echo "::error::espeak-ng-data not found -- check where the CMake build produces it against the pinned commit" >&2
+          exit 1
+        fi
+        cp -r "$data_dir" src-tauri/resources/espeak-ng-data
+        echo "binary-path=$dest" >> "$GITHUB_OUTPUT"
+        echo "espeak-data-path=src-tauri/resources/espeak-ng-data" >> "$GITHUB_OUTPUT"
+
+    - name: Fetch bundled default voice
+      id: voice
+      shell: bash
+      run: |
+        set -eu
+        mkdir -p src-tauri/resources/voices
+        base="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium"
+        onnx="src-tauri/resources/voices/en_US-lessac-medium.onnx"
+        cfg="src-tauri/resources/voices/en_US-lessac-medium.onnx.json"
+        curl -fL -o "$onnx" "$base/en_US-lessac-medium.onnx"
+        curl -fL -o "$cfg" "$base/en_US-lessac-medium.onnx.json"
+        # Byte-count sanity check (src-tauri/resources/voices/README.md) -- a
+        # truncated download must fail the build, not ship a voice that fails to
+        # load silently at first use.
+        size=$(wc -c < "$onnx")
+        if [ "$size" -ne 63201294 ]; then
+          echo "::error::en_US-lessac-medium.onnx is $size bytes, expected 63201294 -- download truncated or upstream file changed" >&2
+          exit 1
+        fi
+        echo "onnx-path=$onnx" >> "$GITHUB_OUTPUT"
+        echo "config-path=$cfg" >> "$GITHUB_OUTPUT"

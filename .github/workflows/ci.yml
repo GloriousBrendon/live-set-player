@@ -4,6 +4,10 @@ on:
   push:
     branches: ["**"]
     tags: ["v*"]
+  # Manual trigger for verify-piper-sidecar (below): confirms the CMake target
+  # name, CLI flags, and espeak-ng-data lookup against a real build, without
+  # cutting a release tag.
+  workflow_dispatch: {}
 
 # Cancel superseded runs on the same branch, but never on a tag push (a release
 # build should always run to completion).
@@ -26,6 +30,10 @@ env:
     libxdo-dev
     libssl-dev
     libasound2-dev
+  # Pinned Piper sidecar source (docs/SPEC.md §8, src-tauri/binaries/README.md):
+  # bumping this is a deliberate act, not an incidental one -- re-verify the CLI
+  # still builds clean and re-check its flag surface before changing it.
+  PIPER_COMMIT: f04d52c5528ac7cf2d73757f57990ff490f75005
 
 jobs:
   test:
@@ -87,8 +95,10 @@ jobs:
           # isn't one of the two formats §14 asks for.
           - os: ubuntu-22.04
             bundles: appimage,deb
+            target_triple: x86_64-unknown-linux-gnu
           - os: windows-latest
             bundles: nsis
+            target_triple: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
 
@@ -114,6 +124,40 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      # Built here, once per release, from the pinned commit -- never on the
+      # `test` job above and never on a contributor's machine. This is the whole
+      # point: `piper-rs` needed libclang + CMake on every `cargo build`; building
+      # a standalone CLI ourselves confines that requirement to this one job,
+      # which already has a full per-OS build environment for Tauri itself. Run
+      # `workflow_dispatch`'s `verify-piper-sidecar` job below before trusting
+      # this on a real release if the pinned commit has changed since it was last
+      # verified (src-tauri/binaries/README.md).
+      - name: Build Piper sidecar
+        uses: ./.github/actions/build-piper-sidecar
+        with:
+          target-triple: ${{ matrix.target_triple }}
+          piper-commit: ${{ env.PIPER_COMMIT }}
+
+      # `externalBin`/`resources` are patched into tauri.conf.json here, not
+      # committed statically: Tauri's build script validates those paths exist at
+      # *every* `cargo build`, including a bare local one, not just at bundle
+      # time -- committing them unconditionally would mean `cargo test --workspace`
+      # fails on any machine without the sidecar binary already staged, which is
+      # every dev machine (the whole reason it's a CI-only build, docs/SPEC.md §8).
+      # `jq` ships preinstalled on both GitHub-hosted runner images used here.
+      - name: Wire the Piper sidecar into tauri.conf.json
+        shell: bash
+        working-directory: src-tauri
+        run: |
+          set -eu
+          jq '.bundle.externalBin = ["binaries/piper-cli"]
+              | .bundle.resources = {
+                  "resources/voices/": "resources/voices/",
+                  "resources/espeak-ng-data/": "resources/espeak-ng-data/",
+                  "resources/licenses/": "resources/licenses/"
+                }' tauri.conf.json > tauri.conf.json.tmp
+          mv tauri.conf.json.tmp tauri.conf.json
+
       - name: Build and publish release
         uses: tauri-apps/tauri-action@v0
         env:
@@ -124,3 +168,106 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: --bundles ${{ matrix.bundles }}
+
+  # Manual-only (workflow_dispatch): builds just the Piper sidecar half of the
+  # release job and actually *runs* the resulting binary against the bundled
+  # voice, on both platforms, without cutting a release tag. This is what
+  # confirms the CMake target name, the CLI flag surface, and the espeak-ng-data
+  # lookup are real rather than the documented best-effort guess (§8,
+  # src-tauri/binaries/README.md) -- the release job itself never proves the CLI
+  # actually runs, only that `tauri build` bundled *something* under that name.
+  verify-piper-sidecar:
+    name: Verify Piper sidecar (${{ matrix.os }})
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target_triple: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target_triple: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ env.LINUX_DEPS }}
+
+      - name: Build Piper sidecar
+        id: sidecar
+        uses: ./.github/actions/build-piper-sidecar
+        with:
+          target-triple: ${{ matrix.target_triple }}
+          piper-commit: ${{ env.PIPER_COMMIT }}
+
+      - name: Render a short WAV and verify the CLI actually works
+        shell: bash
+        run: |
+          set +e
+          bin="${{ steps.sidecar.outputs.binary-path }}"
+          chmod +x "$bin" 2>/dev/null
+
+          {
+            echo "## Piper CLI --help"
+            echo '```'
+            "$bin" --help
+            echo "(exit status: $?)"
+            echo '```'
+          } | tee help_output.txt >> "$GITHUB_STEP_SUMMARY"
+
+          echo "chorus" | "$bin" \
+            --model "${{ steps.sidecar.outputs.voice-onnx-path }}" \
+            --config "${{ steps.sidecar.outputs.voice-config-path }}" \
+            --output_file out.wav \
+            --length_scale 1.0 \
+            --espeak_data "${{ steps.sidecar.outputs.espeak-data-path }}" \
+            >render_stdout.txt 2>render_stderr.txt
+          status=$?
+
+          {
+            echo "## Render invocation"
+            echo "Flags: --model --config --output_file --length_scale --espeak_data (src-tauri/binaries/README.md's documented guess)"
+            echo "Exit status: $status"
+            echo '```'
+            cat render_stdout.txt render_stderr.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "--- stdout ---"; cat render_stdout.txt
+          echo "--- stderr ---"; cat render_stderr.txt
+          echo "exit status: $status"
+
+          if [ "$status" -ne 0 ]; then
+            echo "::error::Piper CLI invocation failed (exit $status) with the flags documented in src-tauri/binaries/README.md -- read the --help output above (also in the job summary and the help_output.txt artifact) for the real flag names and correct tts.rs / the README from that, not from this guess."
+            exit 1
+          fi
+
+          if [ ! -s out.wav ]; then
+            echo "::error::out.wav is empty or missing despite exit 0"
+            exit 1
+          fi
+
+          head_bytes=$(head -c 4 out.wav)
+          wave_bytes=$(tail -c +9 out.wav | head -c 4)
+          if [ "$head_bytes" != "RIFF" ] || [ "$wave_bytes" != "WAVE" ]; then
+            echo "::error::out.wav does not have a valid RIFF/WAVE header (got '$head_bytes'/'$wave_bytes')"
+            exit 1
+          fi
+
+          echo "OK: rendered a valid, non-empty WAV with the documented flags." | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload verification artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: piper-sidecar-verify-${{ matrix.target_triple }}
+          path: |
+            help_output.txt
+            render_stdout.txt
+            render_stderr.txt
+            out.wav
+          if-no-files-found: ignore
