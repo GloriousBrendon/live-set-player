@@ -150,13 +150,15 @@ jobs:
       # sweep up the shared libraries verify-piper-sidecar proved piper-cli
       # actually needs at runtime (src-tauri/binaries/README.md's "Runtime
       # dependencies"), so those are added as `resources` here too, platform by
-      # platform. **Not yet verified**: whether Tauri's packaged resource
-      # directory is actually where the OS's dynamic loader looks relative to the
-      # sidecar binary inside a real bundle (AppImage/NSIS) -- confirmed so far is
-      # only that the binary runs when these sit beside it in a plain directory
-      # (the CI build tree), not that a `tauri build` bundle preserves that
-      # relationship. Verifying that needs an actual packaged build, which is
-      # phase-5 work (no frontend to bundle yet).
+      # platform. **Confirmed on Windows** (phase-5, real `tauri build` + installed
+      # NSIS package, 2026-08-14, src-tauri/binaries/README.md has the full
+      # writeup): `externalBin` and `bundle.resources` land in the same directory
+      # (`%LOCALAPPDATA%\lsp-scaffold\`, currentUser install mode), so
+      # `current_exe().parent()` and `app.path().resource_dir()` agree and the DLLs
+      # resolve via Windows' default same-directory search -- no fix needed.
+      # **AppImage (Linux) is still unverified** -- needs re-confirming on a Linux
+      # box; expected to carry over the same way via the `$ORIGIN` rpath, but that's
+      # an expectation, not a check yet.
       - name: Wire the Piper sidecar into tauri.conf.json
         shell: bash
         working-directory: src-tauri

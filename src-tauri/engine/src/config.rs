@@ -21,6 +21,23 @@ pub struct AppConfig {
     /// and never below 512 by preference — stability over latency.
     #[serde(default)]
     pub buffer_frames: Option<u32>,
+    /// User-added cue voices beyond the one bundled with the app (`docs/SPEC.md` §8:
+    /// "allow the user to point at additional `.onnx` + `.json` voice files in
+    /// settings"). Absolute, platform-native paths -- unlike project audio paths,
+    /// these live outside any project folder and never need to be portable.
+    #[serde(default)]
+    pub custom_voices: Vec<CustomVoice>,
+}
+
+/// One user-added voice, as chosen through a file picker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomVoice {
+    /// Stable id used in the cue cache key (`crate::tts::cache_key`) and in a
+    /// project's `CueConfig::voice_id` — must not collide with the bundled voice's id
+    /// or another custom voice's.
+    pub id: String,
+    pub onnx_path: String,
+    pub config_path: String,
 }
 
 impl AppConfig {
@@ -75,6 +92,7 @@ mod tests {
         let cfg = AppConfig {
             output_device_name: Some("Focusrite USB ASIO".into()),
             buffer_frames: Some(1024),
+            custom_voices: vec![],
         };
         cfg.save(&path).unwrap();
         let loaded = AppConfig::load(&path).unwrap();

@@ -97,12 +97,25 @@ executable's own directory, so no equivalent step is needed there.
 The CLI looks for `espeak-ng-data/` next to its own executable by default (confirmed);
 `install/espeak-ng-data/` (also installed explicitly by `libpiper/CMakeLists.txt`) is
 bundled as a Tauri resource (`src-tauri/resources/espeak-ng-data/`) rather than placed
-next to the binary here — see `tauri.conf.json`'s `bundle.resources`. **Not yet
-checked:** whether Tauri's packaged app layout actually puts that resource somewhere
-`piper_exe`'s default lookup finds without the `--espeak_data` flag pointing at it
-explicitly — the verify job passes `--espeak_data` explicitly and that's confirmed
-correct; whether the real app needs to do the same (it should, to not depend on
-relative-path luck) is a phase-5 wiring detail, not resolved here.
+next to the binary here — see `tauri.conf.json`'s `bundle.resources`.
+
+**Confirmed against a real packaged bundle**, not just the CI build tree (phase-5,
+Windows NSIS, `installMode: currentUser`, 2026-08-14): a real `tauri build` +
+installed NSIS package puts `externalBin` (`piper-cli.exe`, `piper.dll`,
+`onnxruntime.dll`, `onnxruntime_providers_shared.dll`) and `bundle.resources`
+(`resources/espeak-ng-data/`, `resources/voices/`, `resources/licenses/`) in the
+**same directory** — `%LOCALAPPDATA%\lsp-scaffold\` alongside `lsp-scaffold.exe`
+itself, with `resources/` as a literal subdirectory there. `std::env::current_exe()`
+`.parent()` (for the sidecar binary) and Tauri's `app.path().resource_dir()` (for
+`espeak-ng-data`) both resolve to that same install root, so the app passes
+`--espeak_data` explicitly (`src-tauri/src/sidecar.rs`) and it lands exactly where
+`piper-cli.exe` also finds `piper.dll`/`onnxruntime.dll` via Windows' default
+same-directory DLL search order. Verified by invoking the installed
+`piper-cli.exe` directly with the app's exact resolved paths (exit 0, empty stderr,
+valid output WAV) and by rendering a cue through the installed app itself. No
+resource-layout fix was needed on Windows. **AppImage (Linux) is still unverified** —
+this needs re-confirming on a Linux box; the `$ORIGIN` rpath and same-directory
+staging *should* carry over the same way, but that's an expectation, not a check.
 
 **CLI flags — confirmed via `--help` against the real build** (matches what was
 already documented as a best-effort guess from the legacy `rhasspy/piper` CLI, so
@@ -127,6 +140,22 @@ Text is read from stdin (confirmed: the verify job pipes `echo "chorus" | piper-
 ...`); on success the exe prints the output path to stdout and exits 0. Not currently
 used by `tts.rs` but available if needed later: `--speaker` (multi-speaker voices),
 `--noise_scale`/`--noise_w` (synthesis variation), `--json-input`.
+
+**Two more things confirmed only by actually rendering through the packaged app**,
+both handled in `src-tauri/engine/src/tts.rs`, neither visible from `--help` or a
+one-off CLI run:
+
+- The WAV this build writes carries placeholder `RIFF`/`data` chunk sizes (~2 GB,
+  seemingly a "read until EOF" sentinel for streaming output) instead of the real
+  byte counts. `hound` — used to decode every track, cues included, in
+  `crate::loader` — takes the declared size at face value and fails with "Failed to
+  read enough bytes" on a file that's actually kilobytes. `tts::render_cue` now
+  rewrites both size fields to the file's real length immediately after a successful
+  render (`fix_wav_header_sizes`, with a unit test reproducing the exact placeholder
+  bytes observed).
+- `piper-cli.exe` is a console-subsystem executable; spawning it from the
+  windows-subsystem app flashed a visible console window on every single cue render
+  until `piper_command` set the `CREATE_NO_WINDOW` process creation flag on Windows.
 
 ## Licensing
 

@@ -51,6 +51,7 @@ use crate::project::{Project, Song};
 use crate::render::{AudioBank, CueBank};
 use crate::smoother::{default_ramp_samples, Smoother};
 use crate::timeline::Grid;
+use serde::Serialize;
 use std::sync::Arc;
 
 /// Stop ramp: 10 ms. Panic ramp: 5 ms. Both inside invariant 5's 5–10 ms window.
@@ -251,7 +252,8 @@ pub enum Command {
     LoadSong(Box<Loaded>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TransportState {
     Stopped,
     Playing,
@@ -261,7 +263,8 @@ pub enum TransportState {
 
 /// The queued-section indicator §7 requires the UI to show between an advance
 /// trigger and the bar boundary where it lands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum QueuedStatus {
     None,
     Section(u32),
@@ -269,8 +272,9 @@ pub enum QueuedStatus {
 }
 
 /// One audio→UI status snapshot. `Copy`, so it crosses the queue without touching
-/// the heap.
-#[derive(Debug, Clone, Copy)]
+/// the heap. `Serialize` so the Tauri command layer can hand it to the frontend
+/// as-is -- see `docs/SPEC.md` §9, "UI polls a status snapshot at ~30 Hz."
+#[derive(Debug, Clone, Copy, Serialize)]
 pub struct Status {
     pub state: TransportState,
     /// Absolute performance-time sample position.

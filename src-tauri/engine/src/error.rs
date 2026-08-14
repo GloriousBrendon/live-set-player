@@ -85,6 +85,8 @@ pub enum LoadError {
     UnsupportedFormat { path: String, detail: String },
     #[error("resampling failed: {0}")]
     Resample(String),
+    #[error(transparent)]
+    Project(#[from] ProjectError),
 }
 
 /// Errors from the audio device layer (`docs/SPEC.md` §1).

@@ -1,9 +1,9 @@
 [workspace]
 members = ["engine"]
-# The app crate below (lsp-scaffold) is the default workspace member. It does not
-# depend on lsp-engine yet -- that wiring happens in phase 2, when the Tauri layer
-# starts driving the audio engine. Phase 1 only needs `engine` buildable and testable
-# on its own: `cargo test -p lsp-engine`.
+# The app crate below (lsp-scaffold) is the default workspace member, alongside the
+# `engine` member. CLAUDE.md: run `cargo fmt`/`clippy`/`test` with `--workspace` from
+# this directory, or a bare invocation silently skips `lsp-engine` -- where the real
+# logic lives.
 
 [package]
 name = "lsp-scaffold"
@@ -27,6 +27,8 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+lsp-engine = { path = "engine" }
 

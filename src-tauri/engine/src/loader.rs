@@ -13,10 +13,12 @@
 //! backtracks and stems are mono or stereo by construction.
 
 use crate::error::LoadError;
-use crate::project::{DownmixMode, Project, Song};
+use crate::project::{self, DownmixMode, Project, Song};
 use crate::render::{AudioBank, CueBank};
 use crate::rt::{self, Loaded};
 use crate::tts;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -253,6 +255,138 @@ pub fn load_and_prepare(
         .map_err(|e| LoadError::Resample(format!("prepare failed: {e}")))
 }
 
+/// SHA-256 (of the raw file bytes) and frame count of a WAV file, for §11 integrity
+/// verification. Frame count comes from the WAV header, not a full decode -- this is
+/// meant to run over every track in a project on load, so it must stay cheap.
+pub struct AudioFileCheck {
+    pub sha256: String,
+    pub frames: u64,
+}
+
+/// Compute the current hash and frame count of the file at `path`.
+pub fn verify_audio_file(path: &Path) -> Result<AudioFileCheck, LoadError> {
+    let display = path.display().to_string();
+    let bytes = std::fs::read(path).map_err(|e| LoadError::Io {
+        path: display.clone(),
+        source: e,
+    })?;
+    let digest = Sha256::digest(&bytes);
+    let sha256 = digest.iter().map(|b| format!("{b:02x}")).collect();
+
+    let reader = hound::WavReader::open(path).map_err(|e| match e {
+        hound::Error::IoError(io) => LoadError::Io {
+            path: display.clone(),
+            source: io,
+        },
+        other => LoadError::Wav {
+            path: display,
+            source: other,
+        },
+    })?;
+    Ok(AudioFileCheck {
+        sha256,
+        frames: reader.duration() as u64,
+    })
+}
+
+/// Why a track's on-disk audio file didn't match what `project.json` expects. Both
+/// checks are independent -- a re-export at the same length but different content
+/// still trips `HashMismatch`, and a trimmed/padded re-export at the same content
+/// otherwise still trips `FrameCountMismatch`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifyWarningReason {
+    Missing,
+    HashMismatch,
+    FrameCountMismatch,
+}
+
+/// One §11 integrity warning, identifying the exact song/track it came from so the
+/// editor can surface it next to the right file instead of as a generic banner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VerifyWarning {
+    pub song_id: String,
+    pub track_id: String,
+    pub track_name: String,
+    pub path: String,
+    pub reason: VerifyWarningReason,
+}
+
+/// Read `dir/project.json` and verify every track's audio file against its stored
+/// hash/frame count (`docs/SPEC.md` §11). A missing or changed file is reported as a
+/// [`VerifyWarning`], not a hard failure -- the project still loads so the editor can
+/// show the drummer exactly what's wrong and let them fix it, rather than refusing to
+/// open the set at all.
+pub fn load_project_folder(dir: &Path) -> Result<(Project, Vec<VerifyWarning>), LoadError> {
+    let json_path = dir.join("project.json");
+    let json = std::fs::read_to_string(&json_path).map_err(|e| LoadError::Io {
+        path: json_path.display().to_string(),
+        source: e,
+    })?;
+    let project = project::load_project_json(&json)?;
+
+    let mut warnings = Vec::new();
+    for song in &project.songs {
+        for track in &song.tracks {
+            let full_path = track.file.path.to_platform(dir);
+            let warn = |reason| VerifyWarning {
+                song_id: song.id.clone(),
+                track_id: track.id.clone(),
+                track_name: track.name.clone(),
+                path: track.file.path.as_str().to_string(),
+                reason,
+            };
+            if !full_path.is_file() {
+                warnings.push(warn(VerifyWarningReason::Missing));
+                continue;
+            }
+            let check = verify_audio_file(&full_path)?;
+            if track
+                .file
+                .sha256
+                .as_deref()
+                .is_some_and(|expected| expected != check.sha256)
+            {
+                warnings.push(warn(VerifyWarningReason::HashMismatch));
+            } else if track
+                .file
+                .frames
+                .is_some_and(|expected| expected != check.frames)
+            {
+                warnings.push(warn(VerifyWarningReason::FrameCountMismatch));
+            }
+        }
+    }
+    Ok((project, warnings))
+}
+
+/// Write `project` to `dir/project.json`, first populating any track's `sha256`/
+/// `frames` that are still `None` (the first save after a track is added). Creates
+/// `dir` if it doesn't exist yet, for a brand-new project.
+pub fn save_project_folder(dir: &Path, project: &mut Project) -> Result<(), LoadError> {
+    std::fs::create_dir_all(dir).map_err(|e| LoadError::Io {
+        path: dir.display().to_string(),
+        source: e,
+    })?;
+    for song in &mut project.songs {
+        for track in &mut song.tracks {
+            if track.file.sha256.is_none() || track.file.frames.is_none() {
+                let full_path = track.file.path.to_platform(dir);
+                let check = verify_audio_file(&full_path)?;
+                track.file.sha256 = Some(check.sha256);
+                track.file.frames = Some(check.frames);
+            }
+        }
+    }
+    let json_path = dir.join("project.json");
+    let json = project::to_project_json(project)?;
+    std::fs::write(&json_path, json).map_err(|e| LoadError::Io {
+        path: json_path.display().to_string(),
+        source: e,
+    })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,5 +534,161 @@ mod tests {
             (measured_freq - freq).abs() < 2.0,
             "frequency after resample: {measured_freq} Hz, expected ~{freq} Hz"
         );
+    }
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("lsp_project_{}_{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_minimal_wav(path: &Path, frames: u32) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(path, spec).unwrap();
+        for _ in 0..frames {
+            w.write_sample(0i16).unwrap();
+        }
+        w.finalize().unwrap();
+    }
+
+    fn minimal_project_with_track(track_path: &str) -> Project {
+        use crate::path::RelPath;
+        use crate::project::{AudioFileRef, Track};
+        use crate::timeline::TimeSignature;
+
+        Project {
+            schema_version: crate::project::SCHEMA_VERSION,
+            name: "Test Set".to_string(),
+            sample_rate: 48000,
+            bus_layout: Default::default(),
+            click: Default::default(),
+            cue: Default::default(),
+            songs: vec![Song {
+                id: "song1".to_string(),
+                title: "Disaster Kind".to_string(),
+                bpm: 178.0,
+                time_signature: TimeSignature::FOUR_FOUR,
+                offset_samples: 0,
+                count_in_bars: 1,
+                accent_pattern: vec![],
+                sections: vec![],
+                tracks: vec![Track {
+                    id: "bt".to_string(),
+                    name: "Backtrack".to_string(),
+                    file: AudioFileRef {
+                        path: RelPath::new(track_path).unwrap(),
+                        sha256: None,
+                        frames: None,
+                    },
+                    gain_db: 0.0,
+                    muted: false,
+                    bus: 0,
+                    downmix: DownmixMode::Sum,
+                    kind: Default::default(),
+                }],
+                disabled: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn verify_audio_file_reports_hash_and_frame_count() {
+        let dir = temp_dir("verify");
+        let path = dir.join("bt.wav");
+        write_minimal_wav(&path, 100);
+        let check = verify_audio_file(&path).unwrap();
+        assert_eq!(check.frames, 100);
+        assert_eq!(check.sha256.len(), 64);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_then_load_project_folder_round_trips_with_no_warnings() {
+        let dir = temp_dir("roundtrip");
+        std::fs::create_dir_all(dir.join("audio")).unwrap();
+        write_minimal_wav(&dir.join("audio/bt.wav"), 100);
+
+        let mut project = minimal_project_with_track("audio/bt.wav");
+        save_project_folder(&dir, &mut project).unwrap();
+        assert!(project.songs[0].tracks[0].file.sha256.is_some());
+        assert_eq!(project.songs[0].tracks[0].file.frames, Some(100));
+
+        let (loaded, warnings) = load_project_folder(&dir).unwrap();
+        assert_eq!(loaded, project);
+        assert!(warnings.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_project_folder_warns_on_missing_file() {
+        let dir = temp_dir("missing");
+        let mut project = minimal_project_with_track("audio/bt.wav");
+        // Save without ever creating audio/bt.wav -- save_project_folder will fail to
+        // hash it, so populate the ref by hand instead to isolate the load-side check.
+        project.songs[0].tracks[0].file.sha256 = Some("deadbeef".repeat(8));
+        project.songs[0].tracks[0].file.frames = Some(100);
+        let json = project::to_project_json(&project).unwrap();
+        std::fs::write(dir.join("project.json"), json).unwrap();
+
+        let (_loaded, warnings) = load_project_folder(&dir).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].reason, VerifyWarningReason::Missing);
+        assert_eq!(warnings[0].track_id, "bt");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_project_folder_warns_on_changed_hash() {
+        let dir = temp_dir("changed");
+        std::fs::create_dir_all(dir.join("audio")).unwrap();
+        write_minimal_wav(&dir.join("audio/bt.wav"), 100);
+
+        let mut project = minimal_project_with_track("audio/bt.wav");
+        save_project_folder(&dir, &mut project).unwrap();
+
+        // Re-export the backtrack: same path, different content.
+        write_minimal_wav(&dir.join("audio/bt.wav"), 200);
+
+        let (_loaded, warnings) = load_project_folder(&dir).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].reason, VerifyWarningReason::HashMismatch);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saved_project_json_never_contains_a_backslash_path() {
+        // Simulate what a Windows caller would do: build the RelPath via
+        // `from_platform` from an OS-joined (backslash-separated, on Windows) path,
+        // then confirm the raw JSON on disk is clean forward-slash text.
+        let dir = temp_dir("winpath");
+        std::fs::create_dir_all(dir.join("audio")).unwrap();
+        let wav_path = dir.join("audio").join("disaster-kind.wav");
+        write_minimal_wav(&wav_path, 50);
+
+        let rel = crate::path::RelPath::from_platform(&dir, &wav_path).unwrap();
+        assert_eq!(rel.as_str(), "audio/disaster-kind.wav");
+
+        let mut project = minimal_project_with_track(rel.as_str());
+        save_project_folder(&dir, &mut project).unwrap();
+
+        let raw = std::fs::read_to_string(dir.join("project.json")).unwrap();
+        assert!(
+            !raw.contains('\\'),
+            "project.json contained a backslash: {raw}"
+        );
+
+        let (loaded, warnings) = load_project_folder(&dir).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(
+            loaded.songs[0].tracks[0].file.path.as_str(),
+            "audio/disaster-kind.wav"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

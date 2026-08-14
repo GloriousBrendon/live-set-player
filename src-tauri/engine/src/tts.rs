@@ -103,7 +103,74 @@ fn piper_command(
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    // `piper-cli.exe` is a console-subsystem executable; spawning it from this
+    // GUI-subsystem app would otherwise flash a visible console window on every
+    // single render (confirmed against a real packaged-app run -- every edit that
+    // triggers a cue re-render popped a terminal). CREATE_NO_WINDOW suppresses that
+    // without affecting stdin/stdout/stderr piping above.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
     cmd
+}
+
+/// Piper's own WAV writer here doesn't patch its RIFF/`data` chunk sizes after
+/// writing samples -- it leaves large placeholder values (~2 GB, apparently a "read
+/// until EOF" sentinel meant for streaming output) instead of the real byte counts.
+/// `hound` (used to decode every track including cues, see `crate::loader`) takes
+/// the declared size at face value and errors trying to read gigabytes from a file
+/// that's actually kilobytes -- confirmed against a real packaged-app render, not a
+/// guess. Rewrite both size fields to match the file's actual length so any
+/// standards-compliant reader, not just a streaming one, can decode the result.
+fn fix_wav_header_sizes(path: &Path) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    let file_len = file.metadata()?.len();
+    if file_len < 12 {
+        return Ok(());
+    }
+
+    let mut riff_header = [0u8; 12];
+    file.read_exact(&mut riff_header)?;
+    if &riff_header[0..4] != b"RIFF" || &riff_header[8..12] != b"WAVE" {
+        return Ok(()); // not a WAV we recognise; leave it alone
+    }
+
+    // Walk subchunks looking for "data"; patch its declared size to the number of
+    // bytes actually remaining in the file, and the RIFF size to match.
+    let mut pos: u64 = 12;
+    while pos + 8 <= file_len {
+        file.seek(SeekFrom::Start(pos))?;
+        let mut chunk_header = [0u8; 8];
+        file.read_exact(&mut chunk_header)?;
+        let chunk_id = &chunk_header[0..4];
+        let declared_size = u32::from_le_bytes(chunk_header[4..8].try_into().unwrap()) as u64;
+        let data_start = pos + 8;
+
+        if chunk_id == b"data" {
+            let actual_size = file_len - data_start;
+            file.seek(SeekFrom::Start(pos + 4))?;
+            file.write_all(&(actual_size as u32).to_le_bytes())?;
+            file.seek(SeekFrom::Start(4))?;
+            file.write_all(&((file_len - 8) as u32).to_le_bytes())?;
+            return Ok(());
+        }
+
+        // Chunks are padded to an even number of bytes. Clamp the advance to what's
+        // actually left in the file so a bogus declared size elsewhere can't walk
+        // this loop past EOF.
+        let remaining = file_len.saturating_sub(data_start);
+        let advance = declared_size.min(remaining) + (declared_size & 1);
+        pos = data_start + advance;
+    }
+    Ok(())
 }
 
 /// Render `text` with `voice` at `speed` (1.0 = normal) to `out_path`, unconditionally
@@ -152,7 +219,10 @@ pub fn render_cue(
         });
     }
     match std::fs::metadata(out_path) {
-        Ok(meta) if meta.len() > 0 => Ok(()),
+        Ok(meta) if meta.len() > 0 => {
+            fix_wav_header_sizes(out_path)?;
+            Ok(())
+        }
         _ => Err(CueRenderError::OutputUnreadable(
             out_path.display().to_string(),
         )),
@@ -418,5 +488,47 @@ mod tests {
             report.failed[0].1,
             CueRenderError::VoiceNotFound(_)
         ));
+    }
+
+    /// Reproduces the placeholder-size header a real Piper build was confirmed to
+    /// write (`RIFF` and `data` chunk sizes both ~2 GB regardless of actual content
+    /// length) and checks `fix_wav_header_sizes` rewrites both to match the file's
+    /// real size, leaving the sample data itself untouched.
+    #[test]
+    fn fix_wav_header_sizes_rewrites_placeholder_sizes_to_actual_length() {
+        let path =
+            std::env::temp_dir().join(format!("lsp_tts_test_wavfix_{}.wav", std::process::id()));
+        let samples: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&0x7FFF_F024u32.to_le_bytes()); // bogus RIFF size
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(b"fmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&[3, 0, 1, 0]); // IEEE float, mono
+        bytes.extend_from_slice(&22050u32.to_le_bytes());
+        bytes.extend_from_slice(&88200u32.to_le_bytes());
+        bytes.extend_from_slice(&[4, 0, 32, 0]);
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&0x7FFF_F000u32.to_le_bytes()); // bogus data size
+        bytes.extend_from_slice(&samples);
+        std::fs::write(&path, &bytes).unwrap();
+
+        fix_wav_header_sizes(&path).unwrap();
+
+        let fixed = std::fs::read(&path).unwrap();
+        let riff_size = u32::from_le_bytes(fixed[4..8].try_into().unwrap());
+        let data_size = u32::from_le_bytes(fixed[40..44].try_into().unwrap());
+        assert_eq!(riff_size, fixed.len() as u32 - 8);
+        assert_eq!(data_size, samples.len() as u32);
+        assert_eq!(&fixed[44..], &samples);
+
+        // The fixed file must now be readable by the same decoder every other
+        // track goes through -- the whole point of this fix.
+        let decoded =
+            crate::loader::decode_wav_mono(&path, crate::project::DownmixMode::Sum).unwrap();
+        assert_eq!(decoded.source_rate, 22050);
+
+        let _ = std::fs::remove_file(&path);
     }
 }
