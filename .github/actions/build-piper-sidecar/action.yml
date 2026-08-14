@@ -109,8 +109,28 @@ runs:
         # piper_exe's own build didn't set one (confirmed: "Set ... runtime path
         # of piper_exe to ''" in the build log).
         cp "$lib" "src-tauri/binaries/${libname}"
+
+        # libpiper.so/piper.dll itself dynamically links onnxruntime -- confirmed
+        # the hard way (exit 127, "libonnxruntime.so.1: cannot open shared object
+        # file"). It installs correctly to <prefix>/lib/ (that install rule uses a
+        # proper relative CMAKE_INSTALL_LIBDIR, unlike the buggy one for `piper`
+        # above), so stage everything from there next to the other binaries too.
+        ort_glob="piper1-gpl/install/lib/*.so*"
+        if [ "${{ runner.os }}" = "Windows" ]; then ort_glob="piper1-gpl/install/lib/*.dll"; fi
+        ort_found=0
+        for f in $ort_glob; do
+          [ -f "$f" ] || continue
+          cp -P "$f" "src-tauri/binaries/$(basename "$f")"
+          ort_found=1
+        done
+        if [ "$ort_found" -eq 0 ]; then
+          echo "::error::no onnxruntime runtime library found under piper1-gpl/install/lib (glob: $ort_glob) -- piper_exe/libpiper depend on it at runtime; check libpiper/CMakeLists.txt's onnxruntime install rule against the pinned commit" >&2
+          exit 1
+        fi
+
         if [ "${{ runner.os }}" != "Windows" ]; then
           patchelf --set-rpath '$ORIGIN' "$dest"
+          patchelf --set-rpath '$ORIGIN' "src-tauri/binaries/${libname}"
         fi
         data_dir="piper1-gpl/install/espeak-ng-data"
         if [ ! -d "$data_dir" ]; then
