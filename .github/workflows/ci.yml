@@ -300,3 +300,21 @@ jobs:
             render_stderr.txt
             out.wav
           if-no-files-found: ignore
+
+      # The two artifacts above only prove the CLI runs *inside the CI runner's
+      # flat build tree* -- they don't carry the actual staged binaries, so
+      # there's no way to reproduce the still-open packaged-bundle question
+      # (docs §4/src-tauri/binaries/README.md: does a real `tauri build` bundle
+      # preserve the same relative layout?) outside of CI. Upload the staged
+      # tree itself so it can be downloaded and dropped into a local checkout's
+      # src-tauri/binaries + src-tauri/resources for exactly that check.
+      - name: Upload staged sidecar binaries
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: piper-sidecar-staged-${{ matrix.target_triple }}
+          path: |
+            src-tauri/binaries
+            src-tauri/resources/espeak-ng-data
+            src-tauri/resources/voices
+          if-no-files-found: ignore
