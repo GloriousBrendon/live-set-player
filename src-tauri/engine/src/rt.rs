@@ -42,14 +42,16 @@
 
 use crate::click::{self, ClickSynthConfig};
 use crate::core::{
-    self, db_to_linear, CoreBus, CoreClick, CoreTrack, Entry, PlaybackCore, Sequencer,
+    self, db_to_linear, CoreBus, CoreClick, CoreCue, CoreTrack, Entry, PlaybackCore, Sequencer,
     MAX_BLOCK_FRAMES,
 };
+use crate::cue_schedule;
 use crate::error::RenderError;
 use crate::project::{Project, Song};
-use crate::render::AudioBank;
+use crate::render::{AudioBank, CueBank};
 use crate::smoother::{default_ramp_samples, Smoother};
 use crate::timeline::Grid;
+use std::sync::Arc;
 
 /// Stop ramp: 10 ms. Panic ramp: 5 ms. Both inside invariant 5's 5–10 ms window.
 const STOP_RAMP_MS: f64 = 10.0;
@@ -67,6 +69,11 @@ pub struct SongMeta {
     /// Song offset, already scaled to the engine rate.
     pub offset_samples: i64,
     pub sections: Vec<SectionInfo>,
+    /// Preloaded cue clip per section, index-aligned with `sections`; `None` for a
+    /// section with no cue (`docs/SPEC.md` §8). Populated once at prepare time from
+    /// the already-rendered/cached WAVs `crate::tts` produces -- nothing here ever
+    /// renders a cue, only schedules already-loaded audio.
+    pub cue_clips: Vec<Option<Arc<[f32]>>>,
     /// Output channel per bus (from the project's `BusLayout`).
     pub bus_channels: Vec<u16>,
     /// This song's own count-in length (§6), already clamped to 0-4 bars. Used by
@@ -79,6 +86,7 @@ pub struct SectionInfo {
     pub source_start_bar0: i64,
     pub length_bars: u32,
     pub loopable: bool,
+    pub cue_lead_beats: u32,
 }
 
 /// Scale a sample count from one rate to another (used for `offset_samples` when the
@@ -100,12 +108,17 @@ pub fn prepare_loaded(
     project: &Project,
     song: &Song,
     bank: &AudioBank,
+    cues: &CueBank,
     engine_rate: u32,
 ) -> Result<Box<Loaded>, RenderError> {
     let bus_count = project.bus_layout.buses.len().max(1);
     let click_bus = project.click.bus;
     if click_bus >= bus_count {
         return Err(RenderError::BusIndexOutOfRange(click_bus, bus_count));
+    }
+    let cue_bus = project.cue.bus;
+    if cue_bus >= bus_count {
+        return Err(RenderError::BusIndexOutOfRange(cue_bus, bus_count));
     }
     let grid = Grid::new(engine_rate, song.bpm, song.time_signature)?;
     let offset_samples = scale_samples(song.offset_samples, project.sample_rate, engine_rate);
@@ -155,7 +168,19 @@ pub fn prepare_loaded(
             .unzip()
     };
 
-    let core = PlaybackCore::new(grid, offset_samples, tracks, click, buses);
+    let cue = CoreCue {
+        bus: cue_bus,
+        gain: Smoother::settled(db_to_linear(project.cue.gain_db) as f32),
+    };
+    let core = PlaybackCore::new(
+        grid,
+        offset_samples,
+        tracks,
+        click,
+        cue,
+        buses,
+        song.sections.len(),
+    );
     let sections = song
         .sections
         .iter()
@@ -163,7 +188,11 @@ pub fn prepare_loaded(
             source_start_bar0: (s.start_bar - 1) as i64,
             length_bars: s.length_bars,
             loopable: s.loopable,
+            cue_lead_beats: s.cue_lead_beats,
         })
+        .collect();
+    let cue_clips = (0..song.sections.len())
+        .map(|i| cues.get(i).cloned())
         .collect();
 
     Ok(Box::new(Loaded {
@@ -172,6 +201,7 @@ pub fn prepare_loaded(
             grid,
             offset_samples,
             sections,
+            cue_clips,
             bus_channels,
             count_in_bars: song.count_in_bars.min(4),
         },
@@ -279,12 +309,82 @@ pub enum Garbage {
     Loaded(Box<Loaded>),
 }
 
+/// Decide which cue(s) to push, if any, now that `entry` has become active
+/// (`docs/SPEC.md` §8 live scheduling): pushes `entry`'s own cue unless it was
+/// already prescheduled by its predecessor, and -- only when `entry`'s own section
+/// isn't `loopable`, so the section after it is deterministic -- also proactively
+/// schedules *that* section's cue with real lead time. A loopable current section
+/// means the section after it can't be known until it's actually left, so nothing is
+/// prescheduled there; that cue instead gets pushed with zero lead time (clamped to
+/// "now" by [`cue_schedule::cue_start_and_end`]'s floor) the moment it actually
+/// starts, via this same function.
+///
+/// Allocation-free: `out` is a scratch `Vec` the caller preallocates and reuses
+/// (`RtEngine::cue_scratch` in live use); this function only ever `push`es into
+/// existing capacity, matching CLAUDE.md invariant 1 for the live callers below.
+/// `precomputed_cue_section` persists across calls (owned by the caller) so a
+/// proactive push made for section N+1 while N was active is recognised and not
+/// redundantly repeated when N+1 itself becomes active.
+fn cues_to_push_for_activated_entry(
+    meta: &SongMeta,
+    entry: &Entry,
+    precomputed_cue_section: &mut Option<usize>,
+    out: &mut Vec<(i64, Arc<[f32]>)>,
+) {
+    let grid = meta.grid;
+    let Some(section) = meta.sections.get(entry.section_index).copied() else {
+        return;
+    };
+
+    if *precomputed_cue_section != Some(entry.section_index) {
+        if let Some(Some(clip)) = meta.cue_clips.get(entry.section_index) {
+            let (start, _end, _warning) = cue_schedule::cue_start_and_end(
+                &grid,
+                entry.perf_start_pulse,
+                section.cue_lead_beats,
+                clip.len() as i64,
+                Some(entry.perf_start_sample),
+            );
+            out.push((start, clip.clone()));
+        }
+    }
+    *precomputed_cue_section = None;
+
+    if !section.loopable {
+        let next_index = entry.section_index + 1;
+        if let (Some(next_section), Some(Some(clip))) = (
+            meta.sections.get(next_index).copied(),
+            meta.cue_clips.get(next_index),
+        ) {
+            let next_entry = core::make_entry(
+                &grid,
+                meta.offset_samples,
+                next_index,
+                next_section.source_start_bar0,
+                entry.perf_start_bar + entry.length_bars as i64,
+                next_section.length_bars,
+            );
+            let (start, _end, _warning) = cue_schedule::cue_start_and_end(
+                &grid,
+                next_entry.perf_start_pulse,
+                next_section.cue_lead_beats,
+                clip.len() as i64,
+                Some(entry.perf_start_sample),
+            );
+            out.push((start, clip.clone()));
+            *precomputed_cue_section = Some(next_index);
+        }
+    }
+}
+
 /// Live-transport [`Sequencer`]: at each entry end, consume the queued jump if one
 /// landed, else loop a loopable section, else fall through to the next section in
 /// list order, else end. Pure arithmetic — allocation-free by construction.
 struct TransportSeq<'a> {
     meta: &'a SongMeta,
     queued: &'a mut Queued,
+    cue_pushes: &'a mut Vec<(i64, Arc<[f32]>)>,
+    precomputed_cue_section: &'a mut Option<usize>,
 }
 
 impl Sequencer for TransportSeq<'_> {
@@ -308,7 +408,7 @@ impl Sequencer for TransportSeq<'_> {
                 }
             }
         };
-        target.map(|idx| {
+        let next = target.map(|idx| {
             let s = &self.meta.sections[idx];
             core::make_entry(
                 &self.meta.grid,
@@ -318,7 +418,16 @@ impl Sequencer for TransportSeq<'_> {
                 ended.perf_start_bar + ended.length_bars as i64,
                 s.length_bars,
             )
-        })
+        });
+        if let Some(next_entry) = &next {
+            cues_to_push_for_activated_entry(
+                self.meta,
+                next_entry,
+                self.precomputed_cue_section,
+                self.cue_pushes,
+            );
+        }
+        next
     }
 }
 
@@ -336,6 +445,17 @@ pub struct RtEngine {
     queued: Queued,
     armed_section: usize,
     panic_pending: bool,
+    /// Section whose cue has already been proactively pushed (with real lead time)
+    /// while its predecessor was still active, awaiting that section actually
+    /// becoming active -- see [`cues_to_push_for_activated_entry`]. `None` means no
+    /// such prescheduling is outstanding (nothing pushed, predecessor was loopable,
+    /// or it's already been consumed).
+    precomputed_cue_section: Option<usize>,
+    /// Scratch buffer for cue pushes decided during a `render_block` call (inside
+    /// `TransportSeq`, which cannot reach `core` directly -- see module docs above)
+    /// or directly in `cmd_play`. Preallocated once in [`new_engine`]; drained into
+    /// `core.schedule_cue` calls and cleared every time it's used, never reallocated.
+    cue_scratch: Vec<(i64, Arc<[f32]>)>,
     /// See [`Command::SetCountInOverride`].
     count_in_override: Option<u32>,
     engine_rate: u32,
@@ -410,6 +530,12 @@ pub fn new_engine(
         queued: Queued::None,
         armed_section: 0,
         panic_pending: false,
+        precomputed_cue_section: None,
+        // At most two pushes per transition (the landed section's own cue plus a
+        // proactive push for the one after it); a handful of spare slots covers
+        // back-to-back transitions inside a single `render_block` call without ever
+        // needing to grow on the audio thread.
+        cue_scratch: Vec::with_capacity(8),
         count_in_override: None,
         engine_rate,
         ramp_samples: default_ramp_samples(engine_rate),
@@ -472,8 +598,15 @@ impl RtEngine {
                         let mut seq = TransportSeq {
                             meta,
                             queued: &mut self.queued,
+                            cue_pushes: &mut self.cue_scratch,
+                            precomputed_cue_section: &mut self.precomputed_cue_section,
                         };
                         core.render_block(n, &mut seq);
+                    }
+                    if !self.cue_scratch.is_empty() {
+                        for (start, clip) in self.cue_scratch.drain(..) {
+                            loaded.core.schedule_cue(start, clip);
+                        }
                     }
                     let core = &loaded.core;
                     for bus in 0..core.bus_count() {
@@ -628,6 +761,7 @@ impl RtEngine {
                 self.queued = Queued::None;
                 self.armed_section = 0;
                 self.panic_pending = false;
+                self.precomputed_cue_section = None;
                 if let Some(old) = old {
                     self.discard(Garbage::Loaded(old));
                 }
@@ -667,6 +801,22 @@ impl RtEngine {
         loaded.core.start(first, count_in_bars);
         self.queued = Queued::None;
         self.state = TransportState::Playing;
+
+        // A fresh `Play` can land anywhere (armed by `ArmSection`/`SeekToSection`
+        // while stopped, per §7's "the next `Play` starts a fresh timeline there"),
+        // so any prescheduling left over from a previous play-through no longer
+        // applies -- start clean, then schedule the first entry's own cue exactly
+        // like any other activation (see `cues_to_push_for_activated_entry`).
+        self.precomputed_cue_section = None;
+        cues_to_push_for_activated_entry(
+            &loaded.meta,
+            &first,
+            &mut self.precomputed_cue_section,
+            &mut self.cue_scratch,
+        );
+        for (start, clip) in self.cue_scratch.drain(..) {
+            loaded.core.schedule_cue(start, clip);
+        }
     }
 
     /// Queue a jump and truncate the active entry at the next bar boundary

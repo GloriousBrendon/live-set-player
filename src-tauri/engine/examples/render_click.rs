@@ -27,10 +27,10 @@
 use lsp_engine::click::ClickSynthConfig; // used to size the default tail so the last click's decay isn't truncated
 use lsp_engine::path::RelPath;
 use lsp_engine::project::{
-    AudioFileRef, Bus, BusLayout, ClickConfig, DownmixMode, Project, Section, Song, Track,
-    TrackKind,
+    AudioFileRef, Bus, BusLayout, ClickConfig, CueConfig, DownmixMode, Project, Section, Song,
+    Track, TrackKind,
 };
-use lsp_engine::render::{self, AudioBank, RenderOptions};
+use lsp_engine::render::{self, AudioBank, CueBank, RenderOptions};
 use lsp_engine::sections::PerformanceEntry;
 use lsp_engine::timeline::TimeSignature;
 use std::path::PathBuf;
@@ -187,6 +187,7 @@ fn main() {
             bus: 1,
             gain_db: 0.0,
         },
+        cue: CueConfig::default(),
         songs: vec![],
     };
 
@@ -292,7 +293,7 @@ fn main() {
         count_in_bars: args.count_in,
     };
 
-    let audio = match render::render_song(&project, &song, &order, &bank, &opts) {
+    let audio = match render::render_song(&project, &song, &order, &bank, &CueBank::new(), &opts) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("render failed: {e}");

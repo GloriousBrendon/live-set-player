@@ -17,10 +17,10 @@
 
 use lsp_engine::path::RelPath;
 use lsp_engine::project::{
-    AudioFileRef, Bus, BusLayout, ClickConfig, DownmixMode, Project, Section, Song, Track,
-    TrackKind,
+    AudioFileRef, Bus, BusLayout, ClickConfig, CueConfig, DownmixMode, Project, Section, Song,
+    Track, TrackKind,
 };
-use lsp_engine::render::{self, AudioBank, RenderOptions};
+use lsp_engine::render::{self, AudioBank, CueBank, RenderOptions};
 use lsp_engine::rt::{self, Command, TransportState};
 use lsp_engine::sections::PerformanceEntry;
 use lsp_engine::timeline::{Grid, TimeSignature};
@@ -51,6 +51,7 @@ fn project() -> Project {
             bus: 1,
             gain_db: 0.0,
         },
+        cue: CueConfig::default(),
         songs: vec![],
     }
 }
@@ -187,6 +188,7 @@ fn offline_reference(song: &Song, order: &[PerformanceEntry], bank: &AudioBank) 
         song,
         order,
         bank,
+        &CueBank::new(),
         &RenderOptions {
             lead_in_samples: 0,
             tail_samples: hit_len() as u64,
@@ -234,7 +236,7 @@ fn live_loop_and_advance_matches_offline_render() {
         .send(Command::SetCountInOverride(Some(0)))
         .ok()
         .unwrap();
-    let loaded = rt::prepare_loaded(&project(), &song, &bank, RATE).unwrap();
+    let loaded = rt::prepare_loaded(&project(), &song, &bank, &CueBank::new(), RATE).unwrap();
     // Perf bars: Intro 0-3, Verse 4-11, Chorus repeats 12-19 / 20-27 / 28-35,
     // Bridge 36-39. Advance during perf bar 35 (last bar of the third repeat).
     let advance_at = perf_bar_sample(35) + 1000;
@@ -292,7 +294,7 @@ fn live_mid_section_advance_truncates_at_bar_boundary() {
         .send(Command::SetCountInOverride(Some(0)))
         .ok()
         .unwrap();
-    let loaded = rt::prepare_loaded(&project(), &song, &bank, RATE).unwrap();
+    let loaded = rt::prepare_loaded(&project(), &song, &bank, &CueBank::new(), RATE).unwrap();
     // Live perf bars: Intro 0-3, Verse from bar 4; advance lands mid bar 5 (the
     // Verse's second bar) => boundary at perf bar 6, Verse truncated to 2 bars.
     // Chorus then spans perf bars 6-13; advance in its last bar (13) releases it
@@ -365,7 +367,7 @@ fn live_seek_matches_offline_render() {
         .send(Command::SetCountInOverride(Some(0)))
         .ok()
         .unwrap();
-    let loaded = rt::prepare_loaded(&project(), &song, &bank, RATE).unwrap();
+    let loaded = rt::prepare_loaded(&project(), &song, &bank, &CueBank::new(), RATE).unwrap();
     let seek_at = perf_bar_sample(1) + 2000; // inside Intro bar 2 => boundary at bar 2
     let mut commands = vec![
         (0usize, Command::LoadSong(loaded)),
@@ -405,7 +407,7 @@ fn arm_section_then_play_starts_fresh_timeline_there() {
         .send(Command::SetCountInOverride(Some(0)))
         .ok()
         .unwrap();
-    let loaded = rt::prepare_loaded(&project(), &song, &bank, RATE).unwrap();
+    let loaded = rt::prepare_loaded(&project(), &song, &bank, &CueBank::new(), RATE).unwrap();
     // Chorus spans perf bars 0-7 in the fresh timeline; advance during bar 7.
     let advance_at = perf_bar_sample(7) + 500;
     let mut commands = vec![
@@ -465,6 +467,7 @@ fn live_count_in_matches_offline_render_with_a_loopable_section_released_by_adva
             &song,
             &order,
             &bank,
+            &CueBank::new(),
             &RenderOptions {
                 lead_in_samples: 0,
                 tail_samples: hit_len() as u64,
@@ -476,7 +479,7 @@ fn live_count_in_matches_offline_render_with_a_loopable_section_released_by_adva
     };
 
     let (mut engine, mut handle, mut garbage) = rt::new_engine(RATE, false);
-    let loaded = rt::prepare_loaded(&project(), &song, &bank, RATE).unwrap();
+    let loaded = rt::prepare_loaded(&project(), &song, &bank, &CueBank::new(), RATE).unwrap();
     let g = grid();
     let count_in_samples = g.pulse_to_sample(count_in_bars as i64 * g.pulses_per_bar());
     // Chorus's perf start is bar 12 (after Intro's 4 + Verse's 8); its second (last)
@@ -544,7 +547,7 @@ fn output_is_invariant_across_block_sizes() {
             .send(Command::SetCountInOverride(Some(0)))
             .ok()
             .unwrap();
-        let loaded = rt::prepare_loaded(&project(), &song, &bank, RATE).unwrap();
+        let loaded = rt::prepare_loaded(&project(), &song, &bank, &CueBank::new(), RATE).unwrap();
         let mut commands = vec![
             (0usize, Command::LoadSong(loaded)),
             (0usize, Command::Play),
@@ -596,7 +599,7 @@ fn starved_and_bursty_callbacks_do_not_corrupt_transport() {
             .send(Command::SetCountInOverride(Some(0)))
             .ok()
             .unwrap();
-        let loaded = rt::prepare_loaded(&project(), &song, &bank, RATE).unwrap();
+        let loaded = rt::prepare_loaded(&project(), &song, &bank, &CueBank::new(), RATE).unwrap();
         let mut commands = vec![
             (0usize, Command::LoadSong(loaded)),
             (0usize, Command::Play),
@@ -624,7 +627,7 @@ fn starved_and_bursty_callbacks_do_not_corrupt_transport() {
         .send(Command::SetCountInOverride(Some(0)))
         .ok()
         .unwrap();
-    let loaded = rt::prepare_loaded(&project(), &song, &bank, RATE).unwrap();
+    let loaded = rt::prepare_loaded(&project(), &song, &bank, &CueBank::new(), RATE).unwrap();
     handle.send(Command::LoadSong(loaded)).ok().unwrap();
     handle.send(Command::Play).ok().unwrap();
 
@@ -697,7 +700,7 @@ fn stop_and_panic_ramp_to_silence() {
             .send(Command::SetCountInOverride(Some(0)))
             .ok()
             .unwrap();
-        let loaded = rt::prepare_loaded(&project(), &song, &bank, RATE).unwrap();
+        let loaded = rt::prepare_loaded(&project(), &song, &bank, &CueBank::new(), RATE).unwrap();
         handle.send(Command::LoadSong(loaded)).ok().unwrap();
         handle.send(Command::Play).ok().unwrap();
 
@@ -741,7 +744,7 @@ fn loopable_section_loops_until_advanced() {
         .send(Command::SetCountInOverride(Some(0)))
         .ok()
         .unwrap();
-    let loaded = rt::prepare_loaded(&project(), &song, &bank, RATE).unwrap();
+    let loaded = rt::prepare_loaded(&project(), &song, &bank, &CueBank::new(), RATE).unwrap();
     let mut commands = vec![
         (0usize, Command::LoadSong(loaded)),
         (0usize, Command::SeekToSection(2)), // arm the Chorus

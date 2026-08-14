@@ -45,10 +45,10 @@ static GLOBAL: CountingAllocator = CountingAllocator;
 
 use lsp_engine::path::RelPath;
 use lsp_engine::project::{
-    AudioFileRef, Bus, BusLayout, ClickConfig, DownmixMode, Project, Section, Song, Track,
-    TrackKind,
+    AudioFileRef, Bus, BusLayout, ClickConfig, CueConfig, DownmixMode, Project, Section, Song,
+    Track, TrackKind,
 };
-use lsp_engine::render::{self, AudioBank};
+use lsp_engine::render::{self, AudioBank, CueBank};
 use lsp_engine::rt::{self, Command};
 use lsp_engine::timeline::TimeSignature;
 
@@ -77,6 +77,7 @@ fn project() -> Project {
             bus: 1,
             gain_db: 0.0,
         },
+        cue: CueConfig::default(),
         songs: vec![],
     }
 }
@@ -148,11 +149,11 @@ fn process_never_touches_the_allocator() {
     let mut bank = AudioBank::new();
     bank.insert("bt", render::silent_stub(1_500_000));
     let (mut engine, mut handle, mut garbage) = rt::new_engine(RATE, false);
-    let first = rt::prepare_loaded(&project(), &song, &bank, RATE).unwrap();
+    let first = rt::prepare_loaded(&project(), &song, &bank, &CueBank::new(), RATE).unwrap();
     // A second song, prepared up front, to be swapped in mid-measurement: the swap
     // itself (Box move in, old Box parked on the garbage queue) must not touch the
     // allocator on the audio thread.
-    let second = rt::prepare_loaded(&project(), &song, &bank, RATE).unwrap();
+    let second = rt::prepare_loaded(&project(), &song, &bank, &CueBank::new(), RATE).unwrap();
 
     handle.send(Command::LoadSong(first)).ok().unwrap();
     handle.send(Command::SeekToSection(1)).ok().unwrap(); // arm the loop section

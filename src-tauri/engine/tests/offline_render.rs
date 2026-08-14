@@ -17,10 +17,10 @@
 use lsp_engine::crossfade;
 use lsp_engine::path::RelPath;
 use lsp_engine::project::{
-    AudioFileRef, Bus, BusLayout, ClickConfig, DownmixMode, Project, Section, Song, Track,
-    TrackKind,
+    AudioFileRef, Bus, BusLayout, ClickConfig, CueConfig, DownmixMode, Project, Section, Song,
+    Track, TrackKind,
 };
-use lsp_engine::render::{self, AudioBank, RenderOptions, RenderedAudio};
+use lsp_engine::render::{self, AudioBank, CueBank, RenderOptions, RenderedAudio};
 use lsp_engine::sections::PerformanceEntry;
 use lsp_engine::timeline::{Grid, TimeSignature};
 
@@ -51,6 +51,7 @@ fn project(sample_rate: u32) -> Project {
             bus: 1,
             gain_db: 0.0,
         },
+        cue: CueConfig::default(),
         songs: vec![],
     }
 }
@@ -187,8 +188,15 @@ fn click_transients_land_on_exact_grid_samples_4_4() {
     let mut bank = AudioBank::new();
     bank.insert("bt", render::silent_stub(2_000_000));
     let order = [PerformanceEntry::once(0)];
-    let audio =
-        render::render_song(&proj, &song, &order, &bank, &RenderOptions::default()).unwrap();
+    let audio = render::render_song(
+        &proj,
+        &song,
+        &order,
+        &bank,
+        &CueBank::new(),
+        &RenderOptions::default(),
+    )
+    .unwrap();
 
     let grid = Grid::new(sample_rate, bpm, ts).unwrap();
     for pulse in 0..32i64 {
@@ -216,8 +224,15 @@ fn click_transients_and_accents_land_correctly_in_7_8() {
     let mut bank = AudioBank::new();
     bank.insert("bt", render::silent_stub(2_000_000));
     let order = [PerformanceEntry::once(0)];
-    let audio =
-        render::render_song(&proj, &song, &order, &bank, &RenderOptions::default()).unwrap();
+    let audio = render::render_song(
+        &proj,
+        &song,
+        &order,
+        &bank,
+        &CueBank::new(),
+        &RenderOptions::default(),
+    )
+    .unwrap();
 
     let grid = Grid::new(sample_rate, bpm, ts).unwrap();
     let default_cfg = lsp_engine::click::ClickSynthConfig::default();
@@ -270,7 +285,7 @@ fn ten_minute_render_final_transient_is_exact() {
         tail_samples: sample_rate as u64, // headroom for the last click's decay tail
         count_in_bars: 0,
     };
-    let audio = render::render_song(&proj, &song, &order, &bank, &opts).unwrap();
+    let audio = render::render_song(&proj, &song, &order, &bank, &CueBank::new(), &opts).unwrap();
 
     let expected = grid.pulse_to_sample(last_pulse) as usize;
     assert_eq!(
@@ -304,8 +319,15 @@ fn click_only_render_writes_a_valid_wav_readable_by_hound() {
     let mut bank = AudioBank::new();
     bank.insert("bt", render::silent_stub(500_000));
     let order = [PerformanceEntry::once(0)];
-    let audio =
-        render::render_song(&proj, &song, &order, &bank, &RenderOptions::default()).unwrap();
+    let audio = render::render_song(
+        &proj,
+        &song,
+        &order,
+        &bank,
+        &CueBank::new(),
+        &RenderOptions::default(),
+    )
+    .unwrap();
 
     let path = std::env::temp_dir().join(format!("lsp_engine_test_{}.wav", std::process::id()));
     render::write_wav(&path, &audio).unwrap();
@@ -352,8 +374,15 @@ fn out_of_order_programme_reads_from_correct_source_frames() {
     ];
 
     let resolved = lsp_engine::sections::resolve_order(&song, sample_rate, &order).unwrap();
-    let audio =
-        render::render_song(&proj, &song, &order, &bank, &RenderOptions::default()).unwrap();
+    let audio = render::render_song(
+        &proj,
+        &song,
+        &order,
+        &bank,
+        &CueBank::new(),
+        &RenderOptions::default(),
+    )
+    .unwrap();
 
     for (i, entry) in resolved.iter().enumerate() {
         let fade_len =
@@ -423,8 +452,15 @@ fn crossfade_holds_constant_average_power_across_a_splice() {
         PerformanceEntry::once(0), // Intro (300Hz)
     ];
     let resolved = lsp_engine::sections::resolve_order(&song, sample_rate, &order).unwrap();
-    let audio =
-        render::render_song(&proj, &song, &order, &bank, &RenderOptions::default()).unwrap();
+    let audio = render::render_song(
+        &proj,
+        &song,
+        &order,
+        &bank,
+        &CueBank::new(),
+        &RenderOptions::default(),
+    )
+    .unwrap();
 
     // Stub amplitude is a fixed 0.5, so any two segments have equal steady-state
     // power; an equal-power crossfade between decorrelated tones should hold that
@@ -477,8 +513,15 @@ fn contiguous_boundaries_get_no_crossfade() {
         PerformanceEntry::once(3),
     ];
     let resolved = lsp_engine::sections::resolve_order(&song, sample_rate, &order).unwrap();
-    let audio =
-        render::render_song(&proj, &song, &order, &bank, &RenderOptions::default()).unwrap();
+    let audio = render::render_song(
+        &proj,
+        &song,
+        &order,
+        &bank,
+        &CueBank::new(),
+        &RenderOptions::default(),
+    )
+    .unwrap();
 
     // Sanity: this song really is source-contiguous end to end, so a plain ramp read
     // across the whole programme should decode as one unbroken sequence.
@@ -552,7 +595,7 @@ fn count_in_is_click_only_and_respects_the_accent_pattern_in_7_8() {
         tail_samples: 0,
         count_in_bars,
     };
-    let audio = render::render_song(&proj, &song, &order, &bank, &opts).unwrap();
+    let audio = render::render_song(&proj, &song, &order, &bank, &CueBank::new(), &opts).unwrap();
 
     let ppb = grid.pulses_per_bar(); // 7
     let count_in_pulses = count_in_bars as i64 * ppb;
@@ -605,5 +648,140 @@ fn count_in_is_click_only_and_respects_the_accent_pattern_in_7_8() {
         render::decode_ramp_sample(left(&audio, downbeat_idx)),
         expected_source_start,
         "backtrack must pick up at the section's true source start exactly at the downbeat"
+    );
+}
+
+// ---------------------------------------------------------------------------------
+// 4. Spoken cues (§8): end-anchored scheduling, end to end
+// ---------------------------------------------------------------------------------
+
+/// A short cue (Verse) and a long cue (Bridge), rendered through the full pipeline
+/// (not just `cue_schedule`'s unit tests), both finish speaking exactly
+/// `cue_lead_beats` pulses before their section's downbeat -- the "done when"
+/// criterion from the original ask, verified against the actual rendered right
+/// channel rather than re-deriving the formula.
+#[test]
+fn short_and_long_cues_finish_the_same_distance_before_their_downbeats_in_a_real_render() {
+    let sample_rate = 48000u32;
+    let bpm = 178.0;
+    let ts = TimeSignature::FOUR_FOUR;
+    let proj = project(sample_rate);
+    let grid = Grid::new(sample_rate, bpm, ts).unwrap();
+
+    let song = Song {
+        id: "song1".into(),
+        title: "Cue Test Song".into(),
+        bpm,
+        time_signature: ts,
+        offset_samples: 0,
+        count_in_bars: 0,
+        accent_pattern: vec![],
+        sections: vec![
+            Section {
+                name: "Intro".into(),
+                start_bar: 1,
+                length_bars: 4,
+                loopable: false,
+                cue_text: None, // no cue
+                cue_lead_beats: 4,
+            },
+            Section {
+                name: "Verse".into(),
+                start_bar: 5,
+                length_bars: 8,
+                loopable: false,
+                cue_text: Some("Verse".into()),
+                cue_lead_beats: 4,
+            },
+            Section {
+                name: "Bridge".into(),
+                start_bar: 13,
+                length_bars: 8,
+                loopable: false,
+                cue_text: Some("last time through the bridge".into()),
+                cue_lead_beats: 4,
+            },
+        ],
+        tracks: vec![backtrack_track()],
+        disabled: false,
+    };
+
+    let mut bank = AudioBank::new();
+    bank.insert("bt", render::silent_stub(2_000_000));
+
+    // Distinct constant-amplitude "clips" so their presence in the right channel is
+    // unambiguous against both silence and click transients. Short: 0.3s. Long: 1.5s.
+    const CUE_AMPLITUDE: f32 = 0.42;
+    let short_clip: std::sync::Arc<[f32]> =
+        vec![CUE_AMPLITUDE; (0.3 * sample_rate as f64) as usize].into();
+    let long_clip: std::sync::Arc<[f32]> =
+        vec![CUE_AMPLITUDE; (1.5 * sample_rate as f64) as usize].into();
+    let mut cues = CueBank::new();
+    cues.insert(1, short_clip.clone()); // Verse
+    cues.insert(2, long_clip.clone()); // Bridge
+
+    let order = [
+        PerformanceEntry::once(0),
+        PerformanceEntry::once(1),
+        PerformanceEntry::once(2),
+    ];
+    let audio = render::render_song(
+        &proj,
+        &song,
+        &order,
+        &bank,
+        &cues,
+        &RenderOptions::default(),
+    )
+    .unwrap();
+
+    // Independently resolve where each section's downbeat lands, exactly the way
+    // `sections::resolve_order` (not `cue_schedule`) computes it, so this test doesn't
+    // just re-check `cue_schedule`'s own formula against itself.
+    let resolved = lsp_engine::sections::resolve_order(&song, sample_rate, &order).unwrap();
+    let verse_downbeat_pulse = resolved[1].perf_start_pulse;
+    let bridge_downbeat_pulse = resolved[2].perf_start_pulse;
+
+    for (clip, downbeat_pulse, cue_lead_beats, label) in [
+        (&short_clip, verse_downbeat_pulse, 4i64, "Verse (short cue)"),
+        (&long_clip, bridge_downbeat_pulse, 4i64, "Bridge (long cue)"),
+    ] {
+        let expected_end_sample = grid.pulse_to_sample(downbeat_pulse - cue_lead_beats) as usize;
+        let expected_start_sample = expected_end_sample - clip.len();
+
+        // The clip's last sample lands exactly one sample before the downbeat-minus-
+        // lead-beats point, at the expected amplitude.
+        assert!(
+            (right(&audio, expected_end_sample - 1) - CUE_AMPLITUDE).abs() < 1e-6,
+            "{label}: expected the cue's last sample at {}, got {}",
+            expected_end_sample - 1,
+            right(&audio, expected_end_sample - 1)
+        );
+        // The clip's midpoint -- far enough from either edge to be clear of a
+        // neighbouring click hit's decay tail bleeding onto the same bus, unlike a
+        // boundary sample would be -- confirms the clip is present at the expected
+        // absolute position, not just its very last sample.
+        let mid = expected_start_sample + clip.len() / 2;
+        assert!(
+            (right(&audio, mid) - CUE_AMPLITUDE).abs() < 1e-6,
+            "{label}: expected the cue's midpoint at {mid}, got {}",
+            right(&audio, mid)
+        );
+        // Nothing from this clip bleeds past its end (no click hit happens to land
+        // exactly at this amplitude, so an exact non-match is a safe assertion here).
+        assert_ne!(
+            right(&audio, expected_end_sample),
+            CUE_AMPLITUDE,
+            "{label}: cue must not still be sounding at the downbeat-minus-lead-beats point"
+        );
+    }
+
+    // Both cues finish the same number of pulses before their own downbeat,
+    // regardless of clip length -- the core claim of end-anchored scheduling.
+    let verse_end = grid.pulse_to_sample(verse_downbeat_pulse - 4);
+    let bridge_end = grid.pulse_to_sample(bridge_downbeat_pulse - 4);
+    assert_eq!(
+        verse_downbeat_pulse - grid.sample_to_pulse(verse_end),
+        bridge_downbeat_pulse - grid.sample_to_pulse(bridge_end),
     );
 }

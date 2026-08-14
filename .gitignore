@@ -9,3 +9,15 @@ node_modules
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 *.wav
+
+# Piper sidecar binaries: built by release CI from a pinned commit, never committed
+# (tens of MB, fully reproducible) -- see src-tauri/binaries/README.md.
+/src-tauri/binaries/piper-cli-*
+
+# Bundled default voice model: fetched by release CI from a pinned URL, never
+# committed (~60MB, fully reproducible) -- see src-tauri/resources/voices/README.md.
+/src-tauri/resources/voices/*.onnx
+/src-tauri/resources/voices/*.onnx.json
+
+# espeak-ng-data, produced by the same CI build as the Piper sidecar binaries.
+/src-tauri/resources/espeak-ng-data/

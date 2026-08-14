@@ -14,8 +14,9 @@
 
 use crate::error::LoadError;
 use crate::project::{DownmixMode, Project, Song};
-use crate::render::AudioBank;
+use crate::render::{AudioBank, CueBank};
 use crate::rt::{self, Loaded};
+use crate::tts;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -204,6 +205,39 @@ pub fn load_song_bank(
     Ok(bank)
 }
 
+/// Load every section's already-rendered cue clip for `song` into a [`CueBank`] at
+/// `engine_rate`. Rendering itself is [`crate::tts`]'s job (edit-time, cache-aware);
+/// this is purely the same decode -> downmix -> resample -> `Arc<[f32]>` pipeline
+/// every other track goes through, reading whatever WAV is already cached under the
+/// section's current effective cue text.
+///
+/// A section with non-empty effective cue text but no cached file on disk is a load
+/// error (surfaced via [`LoadError::Io`] from the missing-file open, same as any
+/// other missing track file) rather than a silently absent cue -- the cue sync step
+/// (`tts::sync_project_cues`) should have produced this file before the song is ever
+/// loaded for playback; a missing file here means that step was skipped or failed and
+/// the failure wasn't handled, which must not resolve itself as silence at a gig.
+pub fn load_cue_bank(
+    project_dir: &Path,
+    project: &Project,
+    song: &Song,
+    engine_rate: u32,
+) -> Result<CueBank, LoadError> {
+    let cues_dir = project_dir.join("cues");
+    let mut bank = CueBank::new();
+    for (section_index, section) in song.sections.iter().enumerate() {
+        let text = tts::effective_cue_text(section);
+        if text.is_empty() {
+            continue;
+        }
+        let key = tts::cache_key(text, &project.cue.voice_id, project.cue.speed);
+        let path = tts::cached_cue_path(&cues_dir, &key);
+        let audio = load_track_audio(&path, DownmixMode::Sum, engine_rate)?;
+        bank.insert(section_index, audio);
+    }
+    Ok(bank)
+}
+
 /// Convenience for the worker thread: load a song's files and build the
 /// ready-to-swap [`Loaded`] in one call. All allocation happens here; the audio
 /// thread receives the finished `Box` through `Command::LoadSong`.
@@ -214,7 +248,8 @@ pub fn load_and_prepare(
     engine_rate: u32,
 ) -> Result<Box<Loaded>, LoadError> {
     let bank = load_song_bank(project_dir, song, engine_rate)?;
-    rt::prepare_loaded(project, song, &bank, engine_rate)
+    let cue_bank = load_cue_bank(project_dir, project, song, engine_rate)?;
+    rt::prepare_loaded(project, song, &bank, &cue_bank, engine_rate)
         .map_err(|e| LoadError::Resample(format!("prepare failed: {e}")))
 }
 

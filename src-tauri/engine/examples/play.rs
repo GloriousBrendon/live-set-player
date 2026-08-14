@@ -26,9 +26,10 @@ use lsp_engine::device;
 use lsp_engine::loader;
 use lsp_engine::path::RelPath;
 use lsp_engine::project::{
-    AudioFileRef, BusLayout, ClickConfig, DownmixMode, Project, Section, Song, Track, TrackKind,
+    AudioFileRef, BusLayout, ClickConfig, CueConfig, DownmixMode, Project, Section, Song, Track,
+    TrackKind,
 };
-use lsp_engine::render::AudioBank;
+use lsp_engine::render::{AudioBank, CueBank};
 use lsp_engine::rt::{self, Command, QueuedStatus, TransportState};
 use lsp_engine::timeline::{Grid, TimeSignature};
 use std::path::PathBuf;
@@ -264,6 +265,7 @@ fn main() {
         sample_rate: args.project_rate,
         bus_layout: BusLayout::default(),
         click: ClickConfig::default(),
+        cue: CueConfig::default(),
         songs: vec![],
     };
     let song = Song {
@@ -297,13 +299,14 @@ fn main() {
 
     let mut bank = AudioBank::new();
     bank.insert("bt", audio);
-    let loaded = match rt::prepare_loaded(&project, &song, &bank, opened.engine_rate) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("error preparing song: {e}");
-            std::process::exit(1);
-        }
-    };
+    let loaded =
+        match rt::prepare_loaded(&project, &song, &bank, &CueBank::new(), opened.engine_rate) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("error preparing song: {e}");
+                std::process::exit(1);
+            }
+        };
     handle
         .send(Command::LoadSong(loaded))
         .ok()

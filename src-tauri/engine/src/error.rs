@@ -110,6 +110,30 @@ pub enum DeviceError {
     Backend(String),
 }
 
+/// Errors from spoken-cue rendering (`docs/SPEC.md` §8): shelling out to the Piper
+/// sidecar and caching the result. Every failure has a distinct variant on purpose --
+/// a caller matching on this can only ever report a specific, actionable reason, never
+/// silently treat "couldn't render" as "no cue needed."
+#[derive(Debug, Error)]
+pub enum CueRenderError {
+    #[error("Piper sidecar binary not found at '{0}'; the app bundle is missing it or is corrupt")]
+    SidecarNotFound(String),
+    #[error("failed to spawn the Piper sidecar at '{path}': {source}")]
+    SidecarSpawnFailed {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("Piper sidecar exited with status {status}: {stderr}")]
+    SidecarExitedWithError { status: String, stderr: String },
+    #[error("Piper sidecar reported success but no readable WAV was produced at '{0}'")]
+    OutputUnreadable(String),
+    #[error("cue voice '{0}' is not configured; add it in settings")]
+    VoiceNotFound(String),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
 /// Errors from the offline renderer.
 #[derive(Debug, Error)]
 pub enum RenderError {

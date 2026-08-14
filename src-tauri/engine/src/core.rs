@@ -164,6 +164,27 @@ pub struct CoreClick {
     pub gain: Smoother,
 }
 
+/// Project-wide spoken-cue routing (`docs/SPEC.md` §8): one bus, one independent
+/// gain, shared by every cue clip -- mirrors [`CoreClick`]'s `bus`/`gain` shape, but
+/// carries no synthesis config since cues are preloaded clips, not a formula.
+pub struct CoreCue {
+    pub bus: usize,
+    pub gain: Smoother,
+}
+
+/// One spoken-cue clip scheduled to start at an absolute performance-time sample.
+/// Preloaded audio (`Arc<[f32]>`, cheap to clone -- just a refcount bump, never a
+/// heap allocation) and a start position are all a one-shot voice needs; playback is
+/// stateless, read purely from `perf_pos - start_sample` each block (see
+/// [`render_cues_block`]), the same style [`render_tracks_span`] already uses, so a
+/// seek back into a cue's window replays it naturally with no extra "already played"
+/// bookkeeping.
+#[derive(Clone)]
+pub struct PendingCue {
+    pub start_sample: i64,
+    pub clip: Arc<[f32]>,
+}
+
 /// Progress of the 15 ms equal-power splice crossfade (§7 / invariant 6). `len == 0`
 /// or `pos >= len` means no fade is active. A single slot suffices: the fade length
 /// is capped to the incoming entry's own length, so a fade always completes before
@@ -190,10 +211,15 @@ pub struct PlaybackCore {
     offset_samples: i64,
     tracks: Vec<CoreTrack>,
     click: CoreClick,
+    cue: CoreCue,
     buses: Vec<CoreBus>,
     /// Per-bus output for the most recent block, `bus_count x MAX_BLOCK_FRAMES`.
     bus_buf: Vec<Vec<f32>>,
     click_scratch: Vec<f32>,
+    /// One-shot cue voices scheduled but not yet fully played out (§8). Preallocated
+    /// to `cue_capacity` in [`Self::new`] so [`Self::schedule_cue`] never allocates on
+    /// the audio thread; see that method's docs for the capacity contract.
+    pending_cues: Vec<PendingCue>,
     /// Whole-output gain, 1.0 in normal playback; ramped to 0 for stop/panic.
     master: Smoother,
     active: Option<Entry>,
@@ -217,28 +243,35 @@ impl PlaybackCore {
     /// Construct with everything preallocated. Runs on a worker/UI thread; the audio
     /// thread only ever receives a finished core (boxed, via the command queue).
     ///
-    /// Callers are responsible for validating bus indices (`track.bus` and
-    /// `click.bus` must be `< buses.len()`); [`crate::render::render_song`] and the
-    /// prepare path both do.
+    /// Callers are responsible for validating bus indices (`track.bus`, `click.bus`,
+    /// and `cue.bus` must be `< buses.len()`); [`crate::render::render_song`] and the
+    /// prepare path both do. `cue_capacity` preallocates [`Self::pending_cues`] --
+    /// pass at least the song's section count, an exact upper bound on how many cues
+    /// could ever be outstanding at once (`docs/SPEC.md` §8: one cue per section).
     pub fn new(
         grid: Grid,
         offset_samples: i64,
         tracks: Vec<CoreTrack>,
         click: CoreClick,
+        cue: CoreCue,
         buses: Vec<CoreBus>,
+        cue_capacity: usize,
     ) -> Self {
         let bus_count = buses.len().max(1);
         debug_assert!(tracks.iter().all(|t| t.bus < bus_count));
         debug_assert!(click.bus < bus_count);
+        debug_assert!(cue.bus < bus_count);
         let hit_len = click::hit_length_samples(grid.sample_rate(), click.cfg.decay_ms);
         PlaybackCore {
             grid,
             offset_samples,
             tracks,
             click,
+            cue,
             buses,
             bus_buf: vec![vec![0.0; MAX_BLOCK_FRAMES]; bus_count],
             click_scratch: vec![0.0; MAX_BLOCK_FRAMES],
+            pending_cues: Vec::with_capacity(cue_capacity),
             master: Smoother::settled(1.0),
             active: None,
             pending: None,
@@ -247,6 +280,16 @@ impl PlaybackCore {
             click_limit_pulse: 0,
             hit_len,
         }
+    }
+
+    /// Schedule a one-shot cue voice to start at `start_sample` (absolute
+    /// performance-time). Never allocates *as long as the number of simultaneously
+    /// outstanding cues never exceeds the `cue_capacity` passed to [`Self::new`]* --
+    /// callers on the audio thread (`crate::rt`) must uphold that; it holds by
+    /// construction since at most one cue can be outstanding per section and
+    /// `cue_capacity` is sized to the section count.
+    pub fn schedule_cue(&mut self, start_sample: i64, clip: Arc<[f32]>) {
+        self.pending_cues.push(PendingCue { start_sample, clip });
     }
 
     pub fn grid(&self) -> &Grid {
@@ -387,6 +430,10 @@ impl PlaybackCore {
         self.click.gain.set_target(linear, ramp_samples);
     }
 
+    pub fn set_cue_gain(&mut self, linear: f32, ramp_samples: u32) {
+        self.cue.gain.set_target(linear, ramp_samples);
+    }
+
     pub fn set_limiter_enabled(&mut self, bus: usize, enabled: bool) {
         if let Some(b) = self.buses.get_mut(bus) {
             b.limiter_enabled = enabled;
@@ -476,6 +523,7 @@ impl PlaybackCore {
         }
 
         self.render_click_block(block_start, frames);
+        self.render_cues_block(block_start, frames);
         self.finish_block(frames);
     }
 
@@ -557,6 +605,37 @@ impl PlaybackCore {
             let g = self.click.gain.tick();
             bus[i] += *s * g;
         }
+    }
+
+    /// Mix every pending cue intersecting `[block_start, block_start + frames)` into
+    /// the cue bus, then drop any cue that's now entirely in the past. Stateless by
+    /// construction (§8 / module docs on [`PendingCue`]): each sample is read at
+    /// `perf_pos - cue.start_sample` directly from the clip, never advanced by a
+    /// per-cue cursor, so a seek back into a cue's window replays it rather than
+    /// needing an "already played" flag. Cue gain is ticked once per output sample
+    /// regardless of how many cues overlap it (matching how `finish_block` ticks
+    /// master gain once per sample), not once per cue, so overlapping cues never
+    /// double-advance the ramp.
+    fn render_cues_block(&mut self, block_start: i64, frames: usize) {
+        let bus = &mut self.bus_buf[self.cue.bus];
+        for (i, out) in bus.iter_mut().enumerate().take(frames) {
+            let sample_pos = block_start + i as i64;
+            let mut mixed = 0.0f32;
+            for cue in &self.pending_cues {
+                let clip_index = sample_pos - cue.start_sample;
+                if clip_index >= 0 && (clip_index as usize) < cue.clip.len() {
+                    mixed += cue.clip[clip_index as usize];
+                }
+            }
+            let g = self.cue.gain.tick();
+            *out += mixed * g;
+        }
+        // Drop cues that finished at or before this block's start -- fully mixed in
+        // a previous block (or never audible at all, e.g. an empty clip) and never
+        // needed again. Cues starting later than this block, or still playing
+        // through it, are untouched.
+        self.pending_cues
+            .retain(|c| c.start_sample + c.clip.len() as i64 > block_start);
     }
 
     /// Master gain (per-sample, smoothed) then the per-bus soft-knee limiter.
@@ -711,6 +790,10 @@ mod tests {
                 bus: 1,
                 gain: Smoother::settled(1.0),
             },
+            CoreCue {
+                bus: 1,
+                gain: Smoother::settled(1.0),
+            },
             vec![
                 CoreBus {
                     limiter_enabled: true,
@@ -719,6 +802,7 @@ mod tests {
                     limiter_enabled: false,
                 },
             ],
+            4,
         );
         let e = make_entry(&g, 2400, 0, 4, 0, 8);
         core.start(e, 0);

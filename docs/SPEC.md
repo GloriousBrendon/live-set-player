@@ -227,9 +227,13 @@ clean transients, or using stems (§10).
 Cues are **always TTS**. A robotic voice is acceptable and expected — the entire point is
 that restructuring a set is a text edit, never a re-recording session.
 
-- Engine: **Piper**, via the `piper-rs` crate. Do **not** shell out to a Python or CLI
-  sidecar; bundling that into a cross-platform Tauri app is unnecessary pain. Note that
-  upstream Piper is now `OHF-Voice/piper1-gpl` and is GPL-3.0 licensed.
+- Engine: **Piper**, via a prebuilt CLI sidecar (Tauri `externalBin`), invoked from the
+  worker thread — not the `piper-rs` crate. The crate was tried first and rejected: it
+  unconditionally vendors and compiles espeak-ng via `bindgen`, which requires
+  `libclang` + CMake on *every* machine that runs `cargo build`, not just at release
+  time. The sidecar CLI is instead built once, from a pinned `OHF-Voice/piper1-gpl`
+  commit (GPL-3.0), in the release job only — see `src-tauri/binaries/README.md` for
+  the pinned commit, build steps, and license-bundling details.
 - Ship one voice model with the app; allow the user to point at additional `.onnx` +
   `.json` voice files in settings.
 - Cues render **at edit time, on the worker thread**. Never in the audio thread, never
@@ -256,6 +260,17 @@ So `cue_lead_beats` means "the cue finishes speaking this many beats before the
 downbeat" (default 4 — one bar of 4/4). If the resulting start would collide with a
 previous cue or fall before the current position, start as early as possible and flag a
 warning on that section in the editor.
+
+**Known limitation — cues after a loopable section.** A section immediately following
+a `loopable` one can't reliably get its full `cue_lead_beats` of lead time live: a
+loopable section repeats an unknown number of times until a manual advance, so the
+following section's downbeat isn't knowable far enough ahead, and the cue instead
+starts as early as possible (from the moment the advance actually lands), the same
+too-late fallback above, every time — not just occasionally. This is a structural fact
+about the section list, not a per-render collision, so it's exposed as a field
+(`follows_loopable_section`) on `lsp_engine::cue_schedule::ScheduledCue` rather than
+left implicit here — the editor renders that field as a warning badge directly; there
+is no separate check to reimplement.
 
 Cues route to the click/cue bus with independent gain.
 

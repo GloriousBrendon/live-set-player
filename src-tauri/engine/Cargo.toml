@@ -26,5 +26,7 @@ thiserror = "2"
 cpal = "0.17"
 rtrb = "0.3"
 rubato = "0.16"
+# Content-hash cache key for rendered cues (§8: cache by (text, voice_id, speed)).
+sha2 = "0.10"
 
 [dev-dependencies]

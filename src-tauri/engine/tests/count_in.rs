@@ -12,10 +12,10 @@
 use lsp_engine::click::hit_length_samples;
 use lsp_engine::path::RelPath;
 use lsp_engine::project::{
-    AudioFileRef, Bus, BusLayout, ClickConfig, DownmixMode, Project, Section, Song, Track,
-    TrackKind,
+    AudioFileRef, Bus, BusLayout, ClickConfig, CueConfig, DownmixMode, Project, Section, Song,
+    Track, TrackKind,
 };
-use lsp_engine::render::{self, AudioBank, RenderOptions};
+use lsp_engine::render::{self, AudioBank, CueBank, RenderOptions};
 use lsp_engine::rt::{self, Command, TransportState};
 use lsp_engine::sections::PerformanceEntry;
 use lsp_engine::timeline::{Grid, TimeSignature};
@@ -46,6 +46,7 @@ fn project() -> Project {
             bus: 1,
             gain_db: 0.0,
         },
+        cue: CueConfig::default(),
         songs: vec![],
     }
 }
@@ -127,7 +128,7 @@ fn count_in_beats_remaining_counts_down_from_a_mid_song_rehearsal_start() {
     let song = song();
     let bank = bank();
     let (mut engine, mut handle, mut garbage) = rt::new_engine(RATE, false);
-    let loaded = rt::prepare_loaded(&project(), &song, &bank, RATE).unwrap();
+    let loaded = rt::prepare_loaded(&project(), &song, &bank, &CueBank::new(), RATE).unwrap();
     let count_in_bars = 2u32;
 
     handle.send(Command::LoadSong(loaded)).ok().unwrap();
@@ -221,6 +222,7 @@ fn live_count_in_from_armed_mid_song_section_matches_offline_render() {
         &song,
         &order,
         &bank,
+        &CueBank::new(),
         &RenderOptions {
             lead_in_samples: 0,
             tail_samples: hit_len as u64,
@@ -231,7 +233,7 @@ fn live_count_in_from_armed_mid_song_section_matches_offline_render() {
     .interleaved;
 
     let (mut engine, mut handle, mut garbage) = rt::new_engine(RATE, false);
-    let loaded = rt::prepare_loaded(&project(), &song, &bank, RATE).unwrap();
+    let loaded = rt::prepare_loaded(&project(), &song, &bank, &CueBank::new(), RATE).unwrap();
     handle.send(Command::LoadSong(loaded)).ok().unwrap();
     handle
         .send(Command::SeekToSection(bridge_index))

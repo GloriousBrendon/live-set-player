@@ -258,6 +258,8 @@ claude --model sonnet
 >
 > Keyboard shortcuts for every transport action: play, stop, panic stop, advance section, arm next song.
 >
+>Also: phase 4 left one thing unverified — whether Tauri's packaged resource layout places the ONNX Runtime shared libraries where the OS loader finds them relative to the sidecar binary inside a real bundle. Now that a frontend exists, run an actual tauri build and invoke the bundled sidecar from inside the packaged app to confirm it resolves. If it doesn't, fix the resource layout.
+>
 > Plan first, show me the plan, and wait for approval before writing code.
 
 **Done when:** you can load a project, define sections, hit play, and watch the bar countdown advance correctly against what you hear.

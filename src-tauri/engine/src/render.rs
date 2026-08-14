@@ -14,7 +14,7 @@
 //! `tests/offline_render.rs`.
 
 use crate::click::{self, ClickSynthConfig};
-use crate::core::{self, CoreBus, CoreClick, CoreTrack, PlaybackCore, SliceSequencer};
+use crate::core::{self, CoreBus, CoreClick, CoreCue, CoreTrack, PlaybackCore, SliceSequencer};
 use crate::error::RenderError;
 use crate::project::{Project, Song};
 use crate::sections::{self, PerformanceEntry};
@@ -43,6 +43,27 @@ impl AudioBank {
 
     pub fn get(&self, track_id: &str) -> Option<&Arc<[f32]>> {
         self.0.get(track_id)
+    }
+}
+
+/// Preloaded, mono, project-rate spoken-cue clips (`docs/SPEC.md` §8), keyed by
+/// section index within one song. Mirrors [`AudioBank`]'s shape; populated by
+/// [`crate::loader::load_cue_bank`] from the already-rendered/cached WAVs
+/// [`crate::tts`] produces -- this type carries no rendering logic of its own.
+#[derive(Debug, Default, Clone)]
+pub struct CueBank(HashMap<usize, Arc<[f32]>>);
+
+impl CueBank {
+    pub fn new() -> Self {
+        CueBank(HashMap::new())
+    }
+
+    pub fn insert(&mut self, section_index: usize, audio: Arc<[f32]>) {
+        self.0.insert(section_index, audio);
+    }
+
+    pub fn get(&self, section_index: usize) -> Option<&Arc<[f32]>> {
+        self.0.get(&section_index)
     }
 }
 
@@ -163,6 +184,7 @@ pub fn render_song(
     song: &Song,
     order: &[PerformanceEntry],
     bank: &AudioBank,
+    cues: &CueBank,
     opts: &RenderOptions,
 ) -> Result<RenderedAudio, RenderError> {
     let sample_rate = project.sample_rate;
@@ -176,6 +198,10 @@ pub fn render_song(
     let click_bus = project.click.bus;
     if click_bus >= bus_count {
         return Err(RenderError::BusIndexOutOfRange(click_bus, bus_count));
+    }
+    let cue_bus = project.cue.bus;
+    if cue_bus >= bus_count {
+        return Err(RenderError::BusIndexOutOfRange(cue_bus, bus_count));
     }
 
     let grid = Grid::new(sample_rate, song.bpm, song.time_signature)?;
@@ -224,7 +250,33 @@ pub fn render_song(
             .collect()
     };
 
-    let mut core = PlaybackCore::new(grid, song.offset_samples, core_tracks, click, buses);
+    let cue = CoreCue {
+        bus: cue_bus,
+        gain: Smoother::settled(db_to_linear(project.cue.gain_db) as f32),
+    };
+
+    let mut core = PlaybackCore::new(
+        grid,
+        song.offset_samples,
+        core_tracks,
+        click,
+        cue,
+        buses,
+        song.sections.len(),
+    );
+
+    // Precompute the full cue schedule up front: the offline renderer, unlike the
+    // live engine, always has the whole performance order in hand, so every cue gets
+    // its full lead time (`docs/SPEC.md` §8) with no live-scheduling fallback needed.
+    let scheduled_cues =
+        crate::cue_schedule::schedule_cues(&grid, song, &resolved, |section_index| {
+            cues.get(section_index).map(|clip| clip.len() as i64)
+        });
+    for scheduled in &scheduled_cues {
+        if let Some(clip) = cues.get(scheduled.section_index) {
+            core.schedule_cue(scheduled.start_sample, clip.clone());
+        }
+    }
 
     let entries: Vec<core::Entry> = resolved
         .iter()
@@ -314,7 +366,8 @@ mod tests {
     use super::*;
     use crate::path::RelPath;
     use crate::project::{
-        AudioFileRef, Bus, BusLayout, ClickConfig, DownmixMode, Section, Track, TrackKind,
+        AudioFileRef, Bus, BusLayout, ClickConfig, CueConfig, DownmixMode, Section, Track,
+        TrackKind,
     };
     use crate::timeline::TimeSignature;
 
@@ -341,6 +394,7 @@ mod tests {
                 bus: 1,
                 gain_db: 0.0,
             },
+            cue: CueConfig::default(),
             songs: vec![],
         }
     }
@@ -387,7 +441,15 @@ mod tests {
         let mut bank = AudioBank::new();
         bank.insert("bt", silent_stub(500_000));
         let order = [PerformanceEntry::once(0)];
-        let audio = render_song(&project, &song, &order, &bank, &RenderOptions::default()).unwrap();
+        let audio = render_song(
+            &project,
+            &song,
+            &order,
+            &bank,
+            &CueBank::new(),
+            &RenderOptions::default(),
+        )
+        .unwrap();
 
         for frame in 0..audio.frame_count() {
             let left = audio.interleaved[frame * 2];
@@ -403,7 +465,14 @@ mod tests {
         let song = test_song();
         let bank = AudioBank::new(); // no "bt" inserted
         let order = [PerformanceEntry::once(0)];
-        let err = render_song(&project, &song, &order, &bank, &RenderOptions::default());
+        let err = render_song(
+            &project,
+            &song,
+            &order,
+            &bank,
+            &CueBank::new(),
+            &RenderOptions::default(),
+        );
         assert!(matches!(err, Err(RenderError::MissingTrack(_))));
     }
 
@@ -419,7 +488,7 @@ mod tests {
             tail_samples: 0,
             count_in_bars: 0,
         };
-        let audio = render_song(&project, &song, &order, &bank, &opts).unwrap();
+        let audio = render_song(&project, &song, &order, &bank, &CueBank::new(), &opts).unwrap();
         // No click transient before sample 1000 (bar 1 beat 1 accent lands at 1000).
         for frame in 0..1000 {
             assert_eq!(audio.interleaved[frame * 2 + 1], 0.0);

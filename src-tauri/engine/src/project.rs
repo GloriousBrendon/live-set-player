@@ -26,6 +26,8 @@ pub struct Project {
     #[serde(default)]
     pub click: ClickConfig,
     #[serde(default)]
+    pub cue: CueConfig,
+    #[serde(default)]
     pub songs: Vec<Song>,
 }
 
@@ -45,6 +47,12 @@ impl Project {
             return Err(ProjectError::Validation(format!(
                 "click.bus {} is out of range for {} configured bus(es)",
                 self.click.bus, bus_count
+            )));
+        }
+        if self.cue.bus >= bus_count {
+            return Err(ProjectError::Validation(format!(
+                "cue.bus {} is out of range for {} configured bus(es)",
+                self.cue.bus, bus_count
             )));
         }
         for (song_index, song) in self.songs.iter().enumerate() {
@@ -113,6 +121,39 @@ impl Default for ClickConfig {
 
 fn default_click_bus() -> usize {
     1
+}
+
+/// Project-wide spoken-cue defaults (`docs/SPEC.md` §8). Cues route to the same bus
+/// as the click by default, but with independent gain -- a separate `Smoother` from
+/// the click's, not a shared one (see `crate::core`). `voice_id` names an entry in
+/// the app's (not project's) settings-level voice list -- a stable id, not a path, so
+/// moving a project between machines doesn't change which voice it resolves to or
+/// invalidate the cue content-hash cache (`crate::tts`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CueConfig {
+    #[serde(default)]
+    pub voice_id: String,
+    #[serde(default = "default_cue_speed")]
+    pub speed: f64,
+    #[serde(default)]
+    pub gain_db: f64,
+    #[serde(default = "default_click_bus")]
+    pub bus: usize,
+}
+
+impl Default for CueConfig {
+    fn default() -> Self {
+        CueConfig {
+            voice_id: String::new(),
+            speed: default_cue_speed(),
+            gain_db: 0.0,
+            bus: default_click_bus(),
+        }
+    }
+}
+
+fn default_cue_speed() -> f64 {
+    1.0
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
