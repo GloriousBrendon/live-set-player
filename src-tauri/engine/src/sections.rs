@@ -14,9 +14,13 @@ use crate::project::Song;
 use crate::timeline::{Grid, SourceMap};
 
 /// One entry in a performance order: play `section_index` (into `Song::sections`),
-/// `repeats` times back to back. `repeats` must be at least 1; the live engine's
-/// manual-advance looping (§7) doesn't have a fixed repeat count, but the offline
-/// renderer needs one to produce a deterministic, finite render.
+/// `repeats` times back to back. `repeats` must be at least 1. `repeats > 1` is the
+/// offline stand-in for a `loopable` section's live behaviour (§7: it repeats until a
+/// manual advance, which has no fixed count) -- it's the caller's job to pick the
+/// number of repeats a given render should represent, and [`resolve_order`] rejects
+/// `repeats > 1` on a section that isn't `loopable`, since that could never happen
+/// live and would otherwise render audio silently unmoored from any real
+/// performance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PerformanceEntry {
     pub section_index: usize,
@@ -102,6 +106,22 @@ pub fn resolve_order(
         }
         if entry.repeats == 0 {
             return Err(TimelineError::ZeroRepeats { entry_index });
+        }
+        // A repeat count > 1 is the offline stand-in for live's "loopable section
+        // repeats until advance" (§7) -- the only situation an automatic run of N
+        // back-to-back repeats of the same section corresponds to. Repeating a
+        // non-loopable section wouldn't happen live (nothing there ever
+        // auto-repeats it), so silently accepting it would render audio no real
+        // performance could produce. `resolve_order` is where both offline
+        // rendering and the live transport's `make_entry` calls get their section
+        // spans, so this guard protects both.
+        if entry.repeats > 1 && !section.loopable {
+            return Err(TimelineError::RepeatsOnNonLoopableSection {
+                entry_index,
+                section_index: entry.section_index,
+                name: section.name.clone(),
+                repeats: entry.repeats,
+            });
         }
 
         let source_start_bar0 = (section.start_bar - 1) as i64; // 1-based -> 0-based
@@ -358,6 +378,30 @@ mod tests {
         }];
         let err = resolve_order(&song, 48000, &order).unwrap_err();
         assert!(matches!(err, TimelineError::ZeroRepeats { entry_index: 0 }));
+    }
+
+    /// `repeats > 1` is only meaningful as the offline stand-in for a loopable
+    /// section's live "repeat until advance" -- requesting it on a section that
+    /// isn't loopable would render audio no live performance could ever produce, so
+    /// `resolve_order` rejects it outright rather than silently rendering it.
+    #[test]
+    fn repeats_on_non_loopable_section_is_an_error() {
+        let ts = TimeSignature::FOUR_FOUR;
+        let song = song_with_sections(178.0, ts, 0);
+        let order = [PerformanceEntry {
+            section_index: 0, // Intro, not loopable
+            repeats: 2,
+        }];
+        let err = resolve_order(&song, 48000, &order).unwrap_err();
+        assert!(matches!(
+            err,
+            TimelineError::RepeatsOnNonLoopableSection {
+                entry_index: 0,
+                section_index: 0,
+                repeats: 2,
+                ..
+            }
+        ));
     }
 
     #[test]

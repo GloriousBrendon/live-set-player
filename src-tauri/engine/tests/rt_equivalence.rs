@@ -435,23 +435,28 @@ fn arm_section_then_play_starts_fresh_timeline_there() {
 /// non-default 2-bar count-in, and drives with an awkward block size so the
 /// count-in/downbeat seam isn't always landing on a block boundary.
 ///
-/// Chorus's `loopable` flag is turned off for this fixture: the point of this test is
-/// the count-in seam, not loop-release semantics (already covered by
-/// `live_loop_and_advance_matches_offline_render`) — with it left on and no
-/// `AdvanceSection` ever sent, the live engine would (correctly, per §7) loop the
-/// Chorus again at its end while the offline reference's fixed `order` moves on to
-/// Bridge, a real but unrelated divergence this test isn't testing for.
+/// The programme still includes the loopable Chorus, repeated twice — offline via
+/// `PerformanceEntry { repeats: 2, .. }` (§7's finite stand-in for "loops until
+/// advance", now enforced by `resolve_order` for exactly this reason: see
+/// `RepeatsOnNonLoopableSection`), live via an `AdvanceSection` sent during the
+/// second repeat's last bar. Count-in only shifts *when* content starts, never what
+/// the content is, so this must stay bit-identical with the loop released at the
+/// same point `live_loop_and_advance_matches_offline_render` proves for the
+/// no-count-in case — this is that same case, with a count-in ahead of it.
 #[test]
-fn live_count_in_matches_offline_render() {
-    let mut song = four_section_song(2400);
-    song.sections[2].loopable = false;
+fn live_count_in_matches_offline_render_with_a_loopable_section_released_by_advance() {
+    let song = four_section_song(2400);
     let bank = bank_for(&song);
     let count_in_bars = 2u32; // overrides the song's own count_in_bars (1)
+    let chorus_repeats = 2u32;
 
     let order = [
         PerformanceEntry::once(0),
         PerformanceEntry::once(1),
-        PerformanceEntry::once(2),
+        PerformanceEntry {
+            section_index: 2,
+            repeats: chorus_repeats,
+        },
         PerformanceEntry::once(3),
     ];
     let offline = {
@@ -472,10 +477,23 @@ fn live_count_in_matches_offline_render() {
 
     let (mut engine, mut handle, mut garbage) = rt::new_engine(RATE, false);
     let loaded = rt::prepare_loaded(&project(), &song, &bank, RATE).unwrap();
+    let g = grid();
+    let count_in_samples = g.pulse_to_sample(count_in_bars as i64 * g.pulses_per_bar());
+    // Chorus's perf start is bar 12 (after Intro's 4 + Verse's 8); its second (last)
+    // repeat's final bar is 12 + 8*chorus_repeats - 1 = 27. `perf_bar_sample` is
+    // performance-time-relative (unaffected by count-in — count-in only prepends
+    // negative-time content, it never shifts the content's own bar positions), but
+    // `drive_engine`'s command triggers are output-frame-relative, i.e. relative to
+    // Play, which now starts `count_in_samples` before performance sample 0 — so the
+    // trigger frame needs that offset added back in.
+    let advance_at = (perf_bar_sample(12 + 8 * chorus_repeats as i64 - 1) as i64
+        + 1000
+        + count_in_samples) as usize;
     let mut commands = vec![
         (0usize, Command::SetCountInOverride(Some(count_in_bars))),
         (0usize, Command::LoadSong(loaded)),
         (0usize, Command::Play),
+        (advance_at, Command::AdvanceSection),
     ];
     let frames_total = offline.len() / 2;
     let live = drive_engine(
@@ -486,7 +504,7 @@ fn live_count_in_matches_offline_render() {
         &mut commands,
     );
 
-    assert_identical(&live, &offline, "count-in programme");
+    assert_identical(&live, &offline, "count-in + loopable-section programme");
     let status = handle.latest_status().unwrap();
     assert_eq!(
         status.count_in_beats_remaining, None,

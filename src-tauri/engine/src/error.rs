@@ -23,6 +23,13 @@ pub enum TimelineError {
     ZeroLengthSection { section_index: usize, name: String },
     #[error("performance entry {entry_index} has repeats = 0, which would produce no audio; omit the entry instead")]
     ZeroRepeats { entry_index: usize },
+    #[error("performance entry {entry_index} repeats section {section_index} ('{name}') {repeats} times, but that section isn't loopable; only a loopable section can stand in for live's \"repeat until advance\" (repeats > 1 on a non-loopable section can't correspond to anything a live performance would produce)")]
+    RepeatsOnNonLoopableSection {
+        entry_index: usize,
+        section_index: usize,
+        name: String,
+        repeats: u32,
+    },
     #[error("section {section_index} ('{name}') has start_bar = 0, but start_bar is 1-based and must be >= 1")]
     ZeroStartBar { section_index: usize, name: String },
 }
