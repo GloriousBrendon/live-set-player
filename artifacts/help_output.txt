@@ -1,0 +1,4 @@
+## Piper CLI --help
+```
+(exit status: 0)
+```
