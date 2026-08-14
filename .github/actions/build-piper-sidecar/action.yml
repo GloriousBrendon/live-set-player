@@ -38,13 +38,31 @@ runs:
         ref: ${{ inputs.piper-commit }}
         path: piper1-gpl
 
-    # NOT YET VERIFIED beyond whatever the last verify-piper-sidecar workflow_dispatch
-    # run confirmed -- see src-tauri/binaries/README.md for the current status.
+    # Verified against a real build (verify-piper-sidecar workflow_dispatch run,
+    # 2026-08-14, both platforms -- see src-tauri/binaries/README.md):
+    #
+    # - The repo ROOT CMakeLists.txt is a different build graph entirely (the
+    #   Python module `espeakbridge`, for scikit-build); it has no `piper` target
+    #   at all, which is what made the first attempt fail with "No rule to make
+    #   target 'piper'". The CLI lives in the `libpiper/` subdirectory's own,
+    #   separate CMake project -- configure *that* directory, not the repo root.
+    # - Inside libpiper/CMakeLists.txt, `piper` names the shared *library*
+    #   (`add_library(piper SHARED ...)`). The CLI executable, built via
+    #   `add_subdirectory(src/main)`, is a distinct target: `piper_exe`
+    #   (libpiper/src/main/CMakeLists.txt: `add_executable(piper_exe main.cpp)`).
+    # - This is a real build, not a trivial one: it downloads a prebuilt
+    #   onnxruntime release and builds espeak-ng from source via
+    #   `ExternalProject_Add`, so budget real minutes for it, not seconds.
+    # - `cmake --install` (rather than fishing through the raw build tree) gives
+    #   a clean layout: `<prefix>/bin/piper_exe[.exe]` and
+    #   `<prefix>/espeak-ng-data/` (both installed explicitly by
+    #   libpiper/CMakeLists.txt).
     - name: Build libpiper CLI
       shell: bash
       run: |
-        cmake -S piper1-gpl -B piper1-gpl/build -DCMAKE_BUILD_TYPE=Release
-        cmake --build piper1-gpl/build --config Release --target piper
+        cmake -S piper1-gpl/libpiper -B piper1-gpl/build -DCMAKE_BUILD_TYPE=Release
+        cmake --build piper1-gpl/build --config Release --target piper_exe
+        cmake --install piper1-gpl/build --config Release --prefix piper1-gpl/install
 
     - name: Stage Piper sidecar binary and espeak-ng-data
       id: stage
@@ -54,16 +72,16 @@ runs:
         mkdir -p src-tauri/binaries src-tauri/resources
         suffix=""
         if [ "${{ runner.os }}" = "Windows" ]; then suffix=".exe"; fi
-        built=$(find piper1-gpl/build -maxdepth 4 -iname "piper${suffix}" -type f | head -n1)
-        if [ -z "$built" ]; then
-          echo "::error::libpiper CLI executable not found under piper1-gpl/build -- check the CMake target name against the pinned commit" >&2
+        built="piper1-gpl/install/bin/piper_exe${suffix}"
+        if [ ! -f "$built" ]; then
+          echo "::error::$built not found after 'cmake --install' -- check libpiper/CMakeLists.txt's RUNTIME DESTINATION against the pinned commit" >&2
           exit 1
         fi
         dest="src-tauri/binaries/piper-cli-${{ inputs.target-triple }}${suffix}"
         cp "$built" "$dest"
-        data_dir=$(find piper1-gpl/build piper1-gpl -maxdepth 4 -iname "espeak-ng-data" -type d | head -n1)
-        if [ -z "$data_dir" ]; then
-          echo "::error::espeak-ng-data not found -- check where the CMake build produces it against the pinned commit" >&2
+        data_dir="piper1-gpl/install/espeak-ng-data"
+        if [ ! -d "$data_dir" ]; then
+          echo "::error::$data_dir not found after 'cmake --install' -- check libpiper/CMakeLists.txt's espeak-ng-data install rule against the pinned commit" >&2
           exit 1
         fi
         cp -r "$data_dir" src-tauri/resources/espeak-ng-data
