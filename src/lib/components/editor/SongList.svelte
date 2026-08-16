@@ -42,6 +42,19 @@
 		}
 	}
 
+	async function duplicateSong(index: number) {
+		const copy = await api.duplicateSong(index);
+		project.update((p) => {
+			if (!p) return p;
+			const songs = [...p.songs];
+			songs.splice(index + 1, 0, copy);
+			return { ...p, songs };
+		});
+		if ($currentSongIndex !== null && $currentSongIndex > index) {
+			currentSongIndex.set($currentSongIndex + 1);
+		}
+	}
+
 	function selectSong(index: number) {
 		currentSongIndex.set(index);
 	}
@@ -78,6 +91,9 @@
 			<div class="item" class:selected={$currentSongIndex === i} class:disabled={song.disabled}>
 				<button class="song-select" onclick={() => selectSong(i)}>{song.title || 'Untitled'}</button>
 				<button class="song-arm" title="Arm for playback" onclick={() => armAndSelect(i)}>▶</button>
+				<button class="song-duplicate" title="Duplicate song" onclick={() => duplicateSong(i)}
+					>⧉</button
+				>
 				<button class="song-remove" title="Remove song" onclick={() => removeSong(i)}>✕</button>
 			</div>
 		{/each}
@@ -134,6 +150,7 @@
 		font-size: 0.95rem;
 	}
 	.song-arm,
+	.song-duplicate,
 	.song-remove {
 		background: none;
 		border: none;
@@ -143,6 +160,9 @@
 	}
 	.song-arm:hover {
 		color: #3ddc84;
+	}
+	.song-duplicate:hover {
+		color: #3f8cff;
 	}
 	.song-remove:hover {
 		color: #ff375f;

@@ -28,5 +28,9 @@ rtrb = "0.3"
 rubato = "0.16"
 # Content-hash cache key for rendered cues (§8: cache by (text, voice_id, speed)).
 sha2 = "0.10"
+# MIDI control input (§9): device enumeration + input connection, mirroring cpal's
+# role for the output side. No feature flags enabled -- no JACK/WinRT/CoreMIDI
+# timestamping needed for a plain note-on/CC/program-change footswitch.
+midir = "0.11"
 
 [dev-dependencies]

@@ -21,11 +21,8 @@ function handleKeydown(event: KeyboardEvent): void {
 		case 'Space': {
 			event.preventDefault();
 			const current = get(status);
-			if (current?.state === 'playing') {
-				api.stop().catch(() => {});
-			} else {
-				api.play().catch(() => {});
-			}
+			const action = current?.state === 'playing' ? 'stop' : 'play';
+			api.dispatchAction(action).catch(() => {});
 			break;
 		}
 		case 'KeyS':
@@ -34,20 +31,20 @@ function handleKeydown(event: KeyboardEvent): void {
 				saveProject().catch(() => {});
 			} else {
 				event.preventDefault();
-				api.stop().catch(() => {});
+				api.dispatchAction('stop').catch(() => {});
 			}
 			break;
 		case 'Escape':
 			event.preventDefault();
-			api.panicStop().catch(() => {});
+			api.dispatchAction('panic_stop').catch(() => {});
 			break;
 		case 'ArrowRight':
 			event.preventDefault();
-			api.advanceSection().catch(() => {});
+			api.dispatchAction('advance_section').catch(() => {});
 			break;
 		case 'Enter':
 			event.preventDefault();
-			api.armNextSong().catch(() => {});
+			api.dispatchAction('arm_next_song').catch(() => {});
 			break;
 		default:
 			break;

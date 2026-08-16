@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { startStatusPolling, stopStatusPolling } from '$lib/stores/status';
 	import { startDeviceStatusPolling, stopDeviceStatusPolling } from '$lib/stores/device';
+	import { startMidiStatusPolling, stopMidiStatusPolling } from '$lib/stores/midi';
 	import { installKeyboardShortcuts } from '$lib/keyboard';
 
 	let { children } = $props();
@@ -9,10 +10,12 @@
 	onMount(() => {
 		startStatusPolling();
 		startDeviceStatusPolling();
+		startMidiStatusPolling();
 		const removeShortcuts = installKeyboardShortcuts();
 		return () => {
 			stopStatusPolling();
 			stopDeviceStatusPolling();
+			stopMidiStatusPolling();
 			removeShortcuts();
 		};
 	});

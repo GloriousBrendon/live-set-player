@@ -112,6 +112,18 @@ pub enum DeviceError {
     Backend(String),
 }
 
+/// Errors from the MIDI input layer (`docs/SPEC.md` §9).
+#[derive(Debug, Error)]
+pub enum MidiError {
+    #[error("configured MIDI port '{name}' not found; available: {available:?}")]
+    PortNotFound {
+        name: String,
+        available: Vec<String>,
+    },
+    #[error("MIDI backend error: {0}")]
+    Backend(String),
+}
+
 /// Errors from spoken-cue rendering (`docs/SPEC.md` §8): shelling out to the Piper
 /// sidecar and caching the result. Every failure has a distinct variant on purpose --
 /// a caller matching on this can only ever report a specific, actionable reason, never

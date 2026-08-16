@@ -5,6 +5,7 @@
 	import * as api from '$lib/api';
 	import { debounce } from '$lib/utils';
 	import type { BusLayout, ClickConfig, CueConfig, VoiceInfo } from '$lib/types';
+	import MidiSettings from './MidiSettings.svelte';
 
 	let open = $state(false);
 	let devices = $state<string[]>([]);
@@ -113,6 +114,8 @@
 					{/each}
 				</div>
 			</div>
+
+			<MidiSettings />
 
 			<div class="group">
 				<h3>Click</h3>

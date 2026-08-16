@@ -1,8 +1,16 @@
 //! Transport commands (`docs/SPEC.md` §7, §9): thin wrappers over
 //! `EngineHandle::send`/`latest_status`, plus the two "load a song for playback"
 //! actions (`arm_song`, `arm_next_song`) that bridge the project model to the engine.
+//!
+//! The five actions MIDI bindings and keyboard shortcuts both trigger (§9: "arm next
+//! song", "play", "advance section", "stop", "panic stop") go through [`dispatch`],
+//! which the `dispatch_action` command below and the MIDI host's message callback
+//! (`midi_host.rs`, via `commands::midi`) both call directly -- the same function,
+//! not just equivalent logic, so a footswitch and its keyboard-shortcut counterpart
+//! are indistinguishable to the engine.
 
 use lsp_engine::loader;
+use lsp_engine::midi::Action;
 use lsp_engine::project::Song;
 use lsp_engine::rt::{Command, Status};
 use tauri::State;
@@ -49,19 +57,56 @@ pub fn get_status(state: State<AppState>) -> Option<Status> {
         .and_then(|h| h.latest_status())
 }
 
+fn dispatch_play(state: &AppState) -> Result<(), String> {
+    send_command(state, Command::Play)
+}
+
+fn dispatch_stop(state: &AppState) -> Result<(), String> {
+    send_command(state, Command::Stop)
+}
+
+fn dispatch_panic_stop(state: &AppState) -> Result<(), String> {
+    send_command(state, Command::PanicStop)
+}
+
+fn dispatch_advance_section(state: &AppState) -> Result<(), String> {
+    send_command(state, Command::AdvanceSection)
+}
+
+fn dispatch_arm_next_song(state: &AppState) -> Result<(), String> {
+    arm_next_song_impl(state).map(|_| ())
+}
+
+/// The single entry point every §9 control input (keyboard, MIDI) routes through for
+/// these five actions -- see the module doc comment.
+pub fn dispatch(state: &AppState, action: Action) -> Result<(), String> {
+    match action {
+        Action::Play => dispatch_play(state),
+        Action::Stop => dispatch_stop(state),
+        Action::AdvanceSection => dispatch_advance_section(state),
+        Action::ArmNextSong => dispatch_arm_next_song(state),
+        Action::PanicStop => dispatch_panic_stop(state),
+    }
+}
+
+#[tauri::command]
+pub fn dispatch_action(state: State<AppState>, action: Action) -> Result<(), String> {
+    dispatch(&state, action)
+}
+
 #[tauri::command]
 pub fn play(state: State<AppState>) -> Result<(), String> {
-    send_command(&state, Command::Play)
+    dispatch_play(&state)
 }
 
 #[tauri::command]
 pub fn stop(state: State<AppState>) -> Result<(), String> {
-    send_command(&state, Command::Stop)
+    dispatch_stop(&state)
 }
 
 #[tauri::command]
 pub fn panic_stop(state: State<AppState>) -> Result<(), String> {
-    send_command(&state, Command::PanicStop)
+    dispatch_panic_stop(&state)
 }
 
 #[tauri::command]
@@ -76,7 +121,7 @@ pub fn seek_to_section(state: State<AppState>, section: usize) -> Result<(), Str
 
 #[tauri::command]
 pub fn advance_section(state: State<AppState>) -> Result<(), String> {
-    send_command(&state, Command::AdvanceSection)
+    dispatch_advance_section(&state)
 }
 
 #[tauri::command]
@@ -150,8 +195,7 @@ pub fn arm_song(state: State<AppState>, song_id: String) -> Result<Song, String>
 /// Arm the next enabled song after the current one in setlist order (§9: "arm next
 /// song"). `Ok(None)` when there is no next song, not an error -- reaching the end of
 /// the set is a normal thing to happen at a gig.
-#[tauri::command]
-pub fn arm_next_song(state: State<AppState>) -> Result<Option<Song>, String> {
+fn arm_next_song_impl(state: &AppState) -> Result<Option<Song>, String> {
     let next_id = {
         let guard = state.project.lock().unwrap();
         let ps = guard.as_ref().ok_or("no project loaded")?;
@@ -165,7 +209,12 @@ pub fn arm_next_song(state: State<AppState>) -> Result<Option<Song>, String> {
             .map(|(_, s)| s.id.clone())
     };
     match next_id {
-        Some(id) => arm_song_impl(&state, &id).map(Some),
+        Some(id) => arm_song_impl(state, &id).map(Some),
         None => Ok(None),
     }
+}
+
+#[tauri::command]
+pub fn arm_next_song(state: State<AppState>) -> Result<Option<Song>, String> {
+    arm_next_song_impl(&state)
 }

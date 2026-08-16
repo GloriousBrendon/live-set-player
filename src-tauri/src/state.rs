@@ -2,6 +2,7 @@
 //! handle, the currently loaded project, app config, and resolved Piper/voice paths.
 
 use lsp_engine::config::AppConfig;
+use lsp_engine::midi::{Action, MidiBindingConfig, MidiRouter};
 use lsp_engine::project::Project;
 use lsp_engine::rt::EngineHandle;
 use lsp_engine::tts::{PiperSidecar, VoicePaths};
@@ -10,6 +11,7 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
 use crate::audio_host::{AudioHostMsg, OpenReport};
+use crate::midi_host::MidiHostMsg;
 
 /// The project currently open in the editor, plus the runtime-only "what's armed for
 /// playback" state that isn't part of `project.json` (`docs/SPEC.md` §7: performance
@@ -31,6 +33,39 @@ pub struct AppState {
     /// Result of the last successful device open, cached so `get_device_status` can
     /// report engine rate/channels/notice without round-tripping the audio host.
     pub last_open: Mutex<Option<OpenReport>>,
+    pub midi_tx: Sender<MidiHostMsg>,
+    /// Shared with the `midir` message callback running on the MIDI host thread
+    /// (§9) -- it locks this on every incoming message to route/debounce or, in
+    /// learn mode, to capture a new binding.
+    pub midi: Arc<Mutex<MidiRuntimeState>>,
+}
+
+/// Runtime-only MIDI state (§9): the live binding router plus learn-mode progress.
+/// Not part of `AppConfig` -- only `midi.router`'s bindings (via `AppConfig::
+/// midi_bindings`) and the configured port name are persisted; `learn_pending` and
+/// `last_learned` are UI-session state.
+pub struct MidiRuntimeState {
+    pub router: MidiRouter,
+    /// Whether a MIDI input connection is currently open.
+    pub open: bool,
+    /// Set by `commands::midi::start_midi_learn`; the next message the callback
+    /// parses binds to this action, overwriting any existing binding on that action
+    /// or on that same message (§9: fast rebinding over collision warnings).
+    pub learn_pending: Option<Action>,
+    /// The most recent learn capture, surfaced to the settings UI until the next
+    /// learn starts or the app restarts.
+    pub last_learned: Option<MidiBindingConfig>,
+}
+
+impl MidiRuntimeState {
+    pub fn new(bindings: Vec<MidiBindingConfig>) -> Self {
+        Self {
+            router: MidiRouter::new(bindings),
+            open: false,
+            learn_pending: None,
+            last_learned: None,
+        }
+    }
 }
 
 impl AppState {

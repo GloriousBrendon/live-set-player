@@ -1,5 +1,6 @@
 mod audio_host;
 mod commands;
+mod midi_host;
 mod sidecar;
 mod state;
 
@@ -50,6 +51,9 @@ pub fn run() {
                 }
             }
 
+            let midi_tx = midi_host::spawn();
+            let midi = commands::midi::build_runtime_state(&config);
+
             app.manage(AppState {
                 audio_tx,
                 engine,
@@ -59,7 +63,14 @@ pub fn run() {
                 piper,
                 voices: Mutex::new(voices),
                 last_open,
+                midi_tx,
+                midi,
             });
+
+            // §9: unlike the output device, a missing/unavailable MIDI port at
+            // startup is not a refusal -- keyboard shortcuts remain fully functional
+            // without it, so this is best-effort and silently no-ops on failure.
+            commands::midi::reopen_configured_port(&handle, app.state::<AppState>().inner());
 
             Ok(())
         })
@@ -79,6 +90,7 @@ pub fn run() {
             commands::transport::set_count_in_override,
             commands::transport::arm_song,
             commands::transport::arm_next_song,
+            commands::transport::dispatch_action,
             commands::project::load_project,
             commands::project::save_project,
             commands::project::new_project,
@@ -87,6 +99,7 @@ pub fn run() {
             commands::project::add_song,
             commands::project::remove_song,
             commands::project::reorder_songs,
+            commands::project::duplicate_song,
             commands::project::update_song,
             commands::project::add_track,
             commands::project::remove_track,
@@ -94,6 +107,13 @@ pub fn run() {
             commands::device::list_output_devices,
             commands::device::select_output_device,
             commands::device::get_device_status,
+            commands::midi::list_midi_input_ports,
+            commands::midi::select_midi_input_port,
+            commands::midi::get_midi_status,
+            commands::midi::start_midi_learn,
+            commands::midi::cancel_midi_learn,
+            commands::midi::remove_midi_binding,
+            commands::midi::list_midi_actions,
             commands::cues::sync_all_cues,
             commands::cues::list_voices,
             commands::cues::add_voice_file,

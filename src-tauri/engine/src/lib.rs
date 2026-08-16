@@ -50,6 +50,8 @@
 //!   (§1, no default fallback), platform sample-rate policy, stream wiring.
 //! - [`mmcss`] -- Windows "Pro Audio" MMCSS registration for the callback thread
 //!   (cpal does not do this; see the module docs for what was verified).
+//! - [`midi`] -- MIDI learn-mode binding, debounce, and `midir` device enumeration
+//!   (§9), persisted alongside the output device in [`config::AppConfig`].
 
 pub mod click;
 pub mod config;
@@ -60,6 +62,7 @@ pub mod device;
 pub mod error;
 pub mod limiter;
 pub mod loader;
+pub mod midi;
 pub mod mmcss;
 pub mod path;
 pub mod project;

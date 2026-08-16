@@ -7,6 +7,7 @@
 //! local path). Only the format and the no-fallback semantics live here.
 
 use crate::error::DeviceError;
+use crate::midi::MidiBindingConfig;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -27,6 +28,17 @@ pub struct AppConfig {
     /// these live outside any project folder and never need to be portable.
     #[serde(default)]
     pub custom_voices: Vec<CustomVoice>,
+    /// The chosen MIDI input port, by name (§9, same by-name-never-index persistence
+    /// contract as `output_device_name`, though unlike the output device a missing
+    /// MIDI port at startup is not a refusal -- keyboard shortcuts remain fully
+    /// functional without it). Matched against a live enumeration with
+    /// `midi::port_name_matches` to tolerate WinMM's 31-character truncation.
+    #[serde(default)]
+    pub midi_port_name: Option<String>,
+    /// Learned MIDI-to-action bindings (§9). At most one binding per action or per
+    /// message is kept -- learn mode overwrites on collision.
+    #[serde(default)]
+    pub midi_bindings: Vec<MidiBindingConfig>,
 }
 
 /// One user-added voice, as chosen through a file picker.
@@ -93,11 +105,32 @@ mod tests {
             output_device_name: Some("Focusrite USB ASIO".into()),
             buffer_frames: Some(1024),
             custom_voices: vec![],
+            midi_port_name: Some("USB MIDI Footswitch".into()),
+            midi_bindings: vec![MidiBindingConfig {
+                message: crate::midi::MidiMessage::ControlChange {
+                    channel: 0,
+                    controller: 64,
+                },
+                action: crate::midi::Action::AdvanceSection,
+            }],
         };
         cfg.save(&path).unwrap();
         let loaded = AppConfig::load(&path).unwrap();
         assert_eq!(loaded, cfg);
         assert_eq!(loaded.require_device().unwrap(), "Focusrite USB ASIO");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A `config.json` written before MIDI support existed (no `midi_port_name` /
+    /// `midi_bindings` keys) must still load, per `#[serde(default)]` on both fields.
+    #[test]
+    fn config_without_midi_fields_loads_with_defaults() {
+        let path =
+            std::env::temp_dir().join(format!("lsp_config_premidi_{}.json", std::process::id()));
+        std::fs::write(&path, r#"{"output_device_name":"Focusrite USB ASIO"}"#).unwrap();
+        let cfg = AppConfig::load(&path).unwrap();
+        assert_eq!(cfg.midi_port_name, None);
+        assert!(cfg.midi_bindings.is_empty());
         let _ = std::fs::remove_file(&path);
     }
 

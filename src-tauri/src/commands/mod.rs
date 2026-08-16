@@ -1,5 +1,6 @@
 pub mod cues;
 pub mod device;
+pub mod midi;
 pub mod project;
 pub mod transport;
 

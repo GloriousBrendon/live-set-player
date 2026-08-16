@@ -3,12 +3,14 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import type {
+	Action,
 	BusLayout,
 	ClickConfig,
 	CueConfig,
 	CueSyncSummary,
 	DeviceStatus,
 	LoadProjectResult,
+	MidiStatus,
 	Project,
 	Song,
 	Status,
@@ -25,6 +27,8 @@ export const panicStop = () => invoke<void>('panic_stop');
 export const armSection = (section: number) => invoke<void>('arm_section', { section });
 export const seekToSection = (section: number) => invoke<void>('seek_to_section', { section });
 export const advanceSection = () => invoke<void>('advance_section');
+/** The single code path both keyboard shortcuts and MIDI bindings dispatch through. */
+export const dispatchAction = (action: Action) => invoke<void>('dispatch_action', { action });
 export const setTrackGain = (track: number, db: number) =>
 	invoke<void>('set_track_gain', { track, db });
 export const setTrackMuted = (track: number, muted: boolean) =>
@@ -55,6 +59,7 @@ export const addSong = () => invoke<Song>('add_song');
 export const removeSong = (songIndex: number) => invoke<void>('remove_song', { songIndex });
 export const reorderSongs = (newOrder: number[]) =>
 	invoke<void>('reorder_songs', { newOrder });
+export const duplicateSong = (songIndex: number) => invoke<Song>('duplicate_song', { songIndex });
 export const updateSong = (songIndex: number, song: Song) =>
 	invoke<UpdateSongResult>('update_song', { songIndex, song });
 export const addTrack = (songIndex: number, sourcePath: string, name: string) =>
@@ -69,6 +74,17 @@ export const listOutputDevices = () => invoke<string[]>('list_output_devices');
 export const selectOutputDevice = (name: string) =>
 	invoke<DeviceStatus>('select_output_device', { name });
 export const getDeviceStatus = () => invoke<DeviceStatus>('get_device_status');
+
+// MIDI input (docs/SPEC.md §9)
+export const listMidiInputPorts = () => invoke<string[]>('list_midi_input_ports');
+export const selectMidiInputPort = (name: string) =>
+	invoke<MidiStatus>('select_midi_input_port', { name });
+export const getMidiStatus = () => invoke<MidiStatus>('get_midi_status');
+export const startMidiLearn = (action: Action) => invoke<void>('start_midi_learn', { action });
+export const cancelMidiLearn = () => invoke<void>('cancel_midi_learn');
+export const removeMidiBinding = (action: Action) =>
+	invoke<MidiStatus>('remove_midi_binding', { action });
+export const listMidiActions = () => invoke<Action[]>('list_midi_actions');
 
 // Cues / voices (docs/SPEC.md §8)
 export const syncAllCues = () => invoke<CueSyncSummary>('sync_all_cues');

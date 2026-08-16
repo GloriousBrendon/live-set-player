@@ -164,6 +164,38 @@ pub fn reorder_songs(state: State<AppState>, new_order: Vec<usize>) -> Result<()
     reorder_vec(&mut ps.project.songs, &new_order)
 }
 
+/// Copy `song_index`'s song into a new song right after it (§9: "duplicate a song
+/// without deleting it"). The copy gets a fresh id -- `arm_song`/`arm_next_song` look
+/// songs up by id, so a duplicate that kept the original's id would make arming
+/// ambiguous -- and each of its tracks gets a fresh id too, for hygiene and to match
+/// the `{#each ... (t.id)}` keying the editor already relies on, even though tracks
+/// are addressed by index (not id) at the engine level today.
+#[tauri::command]
+pub fn duplicate_song(state: State<AppState>, song_index: usize) -> Result<Song, String> {
+    let mut guard = state.project.lock().unwrap();
+    let ps = guard.as_mut().ok_or("no project loaded")?;
+    let original = ps
+        .project
+        .songs
+        .get(song_index)
+        .ok_or("song index out of range")?;
+
+    let mut copy = original.clone();
+    copy.id = gen_id("song");
+    for track in &mut copy.tracks {
+        track.id = gen_id("track");
+    }
+
+    let insert_at = song_index + 1;
+    ps.project.songs.insert(insert_at, copy.clone());
+    if let Some(current) = ps.current_song_index {
+        if current >= insert_at {
+            ps.current_song_index = Some(current + 1);
+        }
+    }
+    Ok(copy)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct UpdateSongResult {
     pub song: Song,

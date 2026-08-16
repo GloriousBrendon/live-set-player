@@ -128,6 +128,29 @@ export interface DeviceStatus {
 	error: number | null;
 }
 
+// lsp_engine::midi -- MIDI control input (docs/SPEC.md §9)
+export type MidiMessage =
+	| { note_on: { channel: number; note: number } }
+	| { control_change: { channel: number; controller: number } }
+	| { program_change: { channel: number; program: number } };
+
+/** The five actions bindable to a MIDI trigger or a keyboard shortcut (§9). Also the
+ *  argument to `dispatch_action`, the single code path both go through. */
+export type Action = 'arm_next_song' | 'play' | 'advance_section' | 'stop' | 'panic_stop';
+
+export interface MidiBindingConfig {
+	message: MidiMessage;
+	action: Action;
+}
+
+export interface MidiStatus {
+	configured_port: string | null;
+	open: boolean;
+	bindings: MidiBindingConfig[];
+	learn_pending: Action | null;
+	last_learned: MidiBindingConfig | null;
+}
+
 export interface CueSyncSummary {
 	rendered: number;
 	cached: number;
