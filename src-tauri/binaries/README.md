@@ -113,9 +113,57 @@ itself, with `resources/` as a literal subdirectory there. `std::env::current_ex
 same-directory DLL search order. Verified by invoking the installed
 `piper-cli.exe` directly with the app's exact resolved paths (exit 0, empty stderr,
 valid output WAV) and by rendering a cue through the installed app itself. No
-resource-layout fix was needed on Windows. **AppImage (Linux) is still unverified** —
-this needs re-confirming on a Linux box; the `$ORIGIN` rpath and same-directory
-staging *should* carry over the same way, but that's an expectation, not a check.
+resource-layout fix was needed on Windows.
+
+**Confirmed against a real packaged AppImage too** (2026-08-16, real
+`tauri build --bundles appimage` on a real Linux box, sidecar built locally from the
+pinned commit since CI artifacts weren't reachable from that box — the CI build
+itself was already independently verified via `verify-piper-sidecar`) — and this one
+**did** surface a real bug, not just confirm an assumption:
+
+- Unlike Windows NSIS, Tauri's AppImage bundler does **not** put `externalBin` and
+  `bundle.resources` in the same directory. `piper-cli` lands at `usr/bin/piper-cli`;
+  `libpiper.so` and its onnxruntime siblings (all `resources`, not `externalBin`)
+  land at `usr/lib/<productName>/` (`usr/lib/lsp-scaffold/` here) — a full directory
+  level away, and outside `usr/bin/` entirely. A bare `$ORIGIN` rpath on `piper-cli`,
+  which only ever looks in its own directory, can never find them there.
+- This isn't a latent runtime-only bug either: it broke the *build*.
+  `linuxdeploy` (which `tauri build --bundles appimage` shells out to) walks each
+  binary's real dependency resolution the same way the dynamic linker would, so it
+  hit the same dead end and failed the whole bundle with "Could not find dependency:
+  libpiper.so" rather than producing a broken-but-built AppImage.
+- Fixed with a second rpath entry on `piper-cli` (not `libpiper.so`, which stays
+  flat with its onnxruntime siblings in every layout this project produces, so its
+  own `$ORIGIN` was already correct):
+  `patchelf --set-rpath '$ORIGIN:$ORIGIN/../lib/lsp-scaffold' piper-cli` — the second
+  entry is relative to `usr/bin/`, resolving to `usr/lib/lsp-scaffold/`. Applied in
+  `.github/actions/build-piper-sidecar/action.yml`. The `lsp-scaffold` in that path
+  is `tauri.conf.json`'s `productName`, hardcoded since nothing in the action reads
+  that file — keep the two in sync if `productName` ever changes.
+- Verified two ways: running `piper-cli` directly from the actual built AppImage's
+  extracted tree (`--appimage-extract`, real on-disk layout, `env -i` so no
+  environment variable could be doing the work) with a full render, exit 0, valid
+  WAV; and running the built AppImage itself (via `--appimage-extract-and-run` — the
+  Linux box used for this had no `libfuse.so.2` installed for a literal FUSE mount,
+  which `--appimage-extract-and-run` sidesteps by extracting to the same on-disk
+  layout instead of mounting it, a distinction that doesn't affect rpath resolution
+  either way since `ld.so` doesn't care what filesystem the files sit on) and
+  rendering a cue through the running app's actual existing UI flow: typing into a
+  section's cue-text field already triggers `update_song` → `ensure_cue`
+  (`src-tauri/src/commands/project.rs`) on save, which spawns the real sidecar with
+  no test-only code path involved. Produced a valid ~0.92s `pcm_f32le` mono 22050 Hz
+  WAV (confirmed via `ffprobe`), matching the `fix_wav_header_sizes` real-size
+  rewrite documented below.
+- Two things hit along the way were confirmed to be environment artifacts of that
+  specific Linux box, not project bugs, and needed no project-side fix: a very long
+  build path overflowed upstream espeak-ng's fixed 160-byte `path_home` buffer
+  during its own intonation-compilation step (fixed by building from a short path
+  instead, e.g. `/tmp/...` — GitHub Actions runners' own paths are already short
+  enough that this shouldn't recur there); and `linuxdeploy`'s own bundled `strip`
+  (an old prebuilt binary) couldn't parse the `.relr.dyn` ELF section this
+  particular box's bleeding-edge system toolchain emits, which needed swapping in
+  the system `strip` inside the cached `linuxdeploy` AppImage as a one-off, one-box
+  workaround.
 
 **CLI flags — confirmed via `--help` against the real build** (matches what was
 already documented as a best-effort guess from the legacy `rhasspy/piper` CLI, so

@@ -11,8 +11,15 @@ vite.config.ts.timestamp-*
 *.wav
 
 # Piper sidecar binaries: built by release CI from a pinned commit, never committed
-# (tens of MB, fully reproducible) -- see src-tauri/binaries/README.md.
+# (tens of MB, fully reproducible) -- see src-tauri/binaries/README.md. Covers the
+# CLI itself (piper-cli-*) and the shared libraries staged next to it (libpiper.so,
+# onnxruntime's .so files, and their Windows .dll equivalents) -- a local AppImage
+# verification pass staged all of these here and a bare `git add -A` would otherwise
+# have picked up 60+MB of reproducible binaries.
 /src-tauri/binaries/piper-cli-*
+/src-tauri/binaries/*.so
+/src-tauri/binaries/*.so.*
+/src-tauri/binaries/*.dll
 
 # Bundled default voice model: fetched by release CI from a pinned URL, never
 # committed (~60MB, fully reproducible) -- see src-tauri/resources/voices/README.md.

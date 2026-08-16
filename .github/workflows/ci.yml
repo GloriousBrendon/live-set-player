@@ -156,9 +156,20 @@ jobs:
       # (`%LOCALAPPDATA%\lsp-scaffold\`, currentUser install mode), so
       # `current_exe().parent()` and `app.path().resource_dir()` agree and the DLLs
       # resolve via Windows' default same-directory search -- no fix needed.
-      # **AppImage (Linux) is still unverified** -- needs re-confirming on a Linux
-      # box; expected to carry over the same way via the `$ORIGIN` rpath, but that's
-      # an expectation, not a check yet.
+      # **Confirmed on Linux AppImage too** (2026-08-16, real `tauri build
+      # --bundles appimage` + the built .AppImage actually run, both on a real Linux
+      # box -- full writeup in src-tauri/binaries/README.md): unlike Windows,
+      # `externalBin` and `bundle.resources` do NOT land in the same directory here
+      # -- `piper-cli` goes to `usr/bin/`, but `libpiper.so` and its onnxruntime
+      # siblings (all `resources`, not `externalBin`) go to
+      # `usr/lib/<productName>/`. A bare `$ORIGIN` rpath on `piper-cli` (this file's
+      # old assumption) can never resolve that split and made `linuxdeploy` fail the
+      # bundle outright with "Could not find dependency: libpiper.so", not just a
+      # latent runtime bug. Fixed in
+      # `.github/actions/build-piper-sidecar/action.yml`'s patchelf step with a
+      # second rpath entry, `$ORIGIN/../lib/lsp-scaffold`, on `piper-cli` only
+      # (`libpiper.so` itself stays flat with its onnxruntime siblings in every
+      # layout, so its own `$ORIGIN` was already correct).
       - name: Wire the Piper sidecar into tauri.conf.json
         shell: bash
         working-directory: src-tauri

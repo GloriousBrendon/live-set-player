@@ -129,7 +129,25 @@ runs:
         fi
 
         if [ "${{ runner.os }}" != "Windows" ]; then
-          patchelf --set-rpath '$ORIGIN' "$dest"
+          # $ORIGIN alone is correct for libname (it and its onnxruntime sibling
+          # always land in the same directory as each other, flat, in every layout
+          # this project produces) but not for $dest: confirmed against a real
+          # `tauri build --bundles appimage` (2026-08-16) that Tauri's AppImage
+          # bundler does NOT put externalBin and resources in the same directory
+          # the way the NSIS bundler does (src-tauri/binaries/README.md's "Confirmed
+          # against a real packaged bundle" section has the full writeup) --
+          # `piper-cli` lands at `usr/bin/piper-cli` but `libpiper.so` (a `resources`
+          # entry, not `externalBin`) lands at `usr/lib/<productName>/libpiper.so`.
+          # A bare `$ORIGIN` rpath on piper-cli therefore looks in `usr/bin/`, where
+          # the library never is, in the AppImage build specifically -- this made
+          # `linuxdeploy` fail outright with "Could not find dependency: libpiper.so"
+          # before the second rpath entry below was added, not just a silent
+          # runtime failure. The second entry is relative to `usr/bin/`, hardcoded
+          # to tauri.conf.json's `productName` ("lsp-scaffold") since nothing here
+          # reads that file; keep the two in sync if productName ever changes. Both
+          # $dest's flat verify-piper-sidecar layout (this same rpath's first entry)
+          # and the Windows NSIS layout (no rpath involved) are unaffected.
+          patchelf --set-rpath '$ORIGIN:$ORIGIN/../lib/lsp-scaffold' "$dest"
           patchelf --set-rpath '$ORIGIN' "src-tauri/binaries/${libname}"
         fi
         data_dir="piper1-gpl/install/espeak-ng-data"
