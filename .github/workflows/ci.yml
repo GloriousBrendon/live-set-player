@@ -79,6 +79,63 @@ jobs:
         working-directory: src-tauri
         run: cargo test --workspace
 
+  # A Linux app bundle you can download and run, without the Piper sidecar and
+  # without cutting a release tag.
+  #
+  # The `release` job below is the real distribution path, but it only fires on a
+  # `v*` tag and it compiles the Piper sidecar (CMake + onnxruntime + espeak-ng)
+  # from source on two platforms first -- tens of minutes, and a failure there
+  # yields no artifact at all. Backing tracks, click, sections and countdowns do
+  # not need Piper; only spoken cues do. So this job exists to get a runnable
+  # build into someone's hands quickly, accepting that cue rendering in it fails
+  # with `CueRenderError::SidecarNotFound` until a tagged release replaces it.
+  #
+  # Deliberately Linux-only (docs/SPEC.md §0: Windows is deferred) and
+  # deliberately not gated on `test`, so a lint failure elsewhere doesn't stand
+  # between a musician and a working binary an hour before a gig.
+  gig-build:
+    name: Gig build (Linux, no TTS)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ env.LINUX_DEPS }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # No jq patching here: tauri.conf.json in the repo carries no
+      # `externalBin`/`resources`, which is exactly what makes a sidecar-free
+      # bundle possible. See the release job for why those are never committed.
+      - name: Build AppImage and .deb
+        run: npx tauri build --bundles appimage,deb
+
+      - name: Upload bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-set-player-linux
+          path: |
+            src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/release/bundle/deb/*.deb
+          if-no-files-found: error
+          retention-days: 14
+
   release:
     name: Release (${{ matrix.os }})
     if: startsWith(github.ref, 'refs/tags/v')
