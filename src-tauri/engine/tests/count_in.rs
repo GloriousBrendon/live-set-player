@@ -47,6 +47,7 @@ fn project() -> Project {
             gain_db: 0.0,
         },
         cue: CueConfig::default(),
+        gap_seconds: 0.0,
         songs: vec![],
     }
 }
@@ -99,6 +100,7 @@ fn song() -> Song {
             section("Bridge", 21, 4, false),
         ],
         tracks: vec![backtrack_track()],
+        auto_continue: false,
         disabled: false,
     }
 }

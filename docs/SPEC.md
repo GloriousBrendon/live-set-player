@@ -1,10 +1,16 @@
 # Live Set Player — Build Specification
 
-Build a desktop application for live band performance playback. It replaces Ableton Live
-for backing tracks, click, and spoken cues during gigs.
+Build an application for live band performance playback: backing tracks, generated
+click, and spoken cues, driven from a setlist.
 
-**Stack:** Tauri 2.x, Rust backend, Svelte frontend.
-**Targets:** Linux and Windows (guest musicians bring their own laptops).
+**Scope (revised).** The target is an **AbleSet-style setlist player that does its own
+audio** — no Ableton Live, no DAW, no plugin host underneath it. AbleSet is a
+*controller* that needs Ableton to make sound; this is the controller and the sound
+engine in one process.
+
+**Stack:** Rust daemon (audio + HTTP), Svelte frontend served over HTTP.
+**Primary target:** Linux, native, minimal resources. Windows is a possible later
+target, not a current one (§1, §14).
 
 ---
 
@@ -22,13 +28,34 @@ Read these before implementing anything; they resolve most ambiguity below.
    data inside the audio callback. Ever.
 4. **Everything derives from one sample clock.** Click, cues, and section boundaries are
    all computed from absolute sample position. Nothing is incremented or accumulated.
+5. **The UI is a network client, not a part of the process.** The daemon owns audio,
+   project state, and config, and exposes them over a local HTTP API (§9.5). The
+   frontend is a static web bundle that talks to that API and holds no authority. This
+   is what keeps the resource footprint small *and* what makes the phase-2 LAN remote
+   (§15) a bind-address change rather than a rewrite.
 
 ### Non-goals
+
+Permanently out of scope. Do not add these even if they seem helpful.
 
 - No plugin hosting.
 - No arrangement/waveform timeline editor.
 - No time-stretching or warping. Audio always plays at native speed.
 - No audio recording.
+- No Ableton Live integration, Link sync, or `.als` parsing. The point of the rewrite
+  is not needing them.
+
+### Deferred
+
+Wanted eventually, deliberately not in the current build. Distinct from non-goals:
+do not build these yet, and do not design them out either.
+
+- **LAN remote UI** — band members controlling the set from phones/tablets (§15).
+  The §9.5 daemon architecture exists so this is cheap later; it is not current scope.
+- **Lyrics** — per-section lyric text and a scrolling lyric display.
+- **OSC input/output.**
+- **Per-role performance layouts** (drummer sees click/tempo, singer sees lyrics).
+- **Windows support** (§1, §14).
 
 ---
 
@@ -51,17 +78,17 @@ Requirements:
 **Sample rate:**
 
 - The project declares a single `sample_rate` (44100 or 48000).
-- **Linux (ALSA/PipeWire):** open the device at exactly the project rate. If unsupported,
-  fail loudly and say which rates the device does support.
-- **Windows (WASAPI shared mode):** `cpal` uses shared mode, where the device advertises
-  only the mix format configured in the Sound control panel. Do not attempt to force the
-  project rate — you cannot, and Windows will resample underneath you without telling you.
-  Instead: read the device's actual rate at open time, treat it as the engine rate, and
-  resample the entire project to it at load time. Surface the mismatch in the UI as an
-  informational notice, not an error.
+- **Linux (ALSA/PipeWire) — the supported platform:** open the device at exactly the
+  project rate. If unsupported, fail loudly and say which rates the device does support.
+- **Windows (WASAPI shared mode) — deferred, code retained.** The engine already handles
+  this case: shared mode advertises only the mix format from the Sound control panel, so
+  the project rate cannot be forced and Windows would resample underneath you silently.
+  The handling is to read the device's actual rate at open time, treat it as the engine
+  rate, resample the project to it at load, and surface the mismatch as an informational
+  notice. **Keep this code and `mmcss.rs`** — they are written, tested, and harmless.
+  Do not extend them, do not test against them, do not let them constrain Linux work.
 - In both cases the engine has exactly one rate for its whole lifetime, fixed at device
-  open. Nothing is resampled at playback time. Verify early which mode you are in — this
-  is the first thing to check if timing behaves differently across platforms.
+  open. Nothing is resampled at playback time.
 - **All audio is resampled to the project rate at load time**, offline, using `rubato`.
   A 44.1k file played on a 48k device without resampling runs 8.8% fast and sharp.
 - All audio is also **downmixed to mono at load time** (sum L+R with −6 dB, configurable
@@ -119,20 +146,21 @@ tempo map. State this as a known limitation in the README.
 
 ## 3. Threading and real-time discipline
 
-Three threads:
+Threads:
 
 | Thread | Owns | Never does |
 |---|---|---|
 | Audio (cpal callback) | Transport, mixer, click synth, scheduler | Allocate, lock, block, drop heap data, log |
-| UI (Tauri/Svelte) | Editing, project state, rendering | Touch engine state directly |
-| Worker | File load, resample, Piper cue rendering, offline render | Block the UI |
+| HTTP / async runtime | API handlers, event stream, project state | Touch engine state directly; block on audio |
+| Worker | File load, resample, Piper cue rendering, offline render | Block the API |
 
 Communication:
 
-- **UI → audio:** lock-free SPSC queue (`rtrb`) carrying a `Command` enum
+- **API → audio:** lock-free SPSC queue (`rtrb`) carrying a `Command` enum
   (`Play`, `Stop`, `ArmSong`, `AdvanceSection`, `SetTrackGain`, `SetMute`, `LoadSet`, …).
-- **Audio → UI:** second lock-free queue carrying position, current section, bars
-  remaining, and xrun counts. UI polls at ~30 Hz.
+- **Audio → API:** second lock-free queue carrying position, current section, bars
+  and seconds remaining, and xrun counts. The API layer reads the latest snapshot and
+  pushes it to clients at ~30 Hz (§9.5).
 - **Simple continuous params** (gains) may use `AtomicU32` bit-cast floats instead.
 - **Freeing memory:** when the audio thread releases an `Arc` to old audio data, push it
   to a garbage queue for the worker thread to drop. Deallocating in the callback causes
@@ -157,8 +185,7 @@ The live rig splits one stereo output: backtrack to FOH, click and cues to in-ea
   **Default the limiter OFF on the click/cue bus** — it will duck the click every time a
   cue speaks. Make it a toggle with a tooltip explaining exactly that.
 - Optional per-track 3-band EQ (biquad: low shelf / peaking / high shelf), coefficients
-  computed on the UI thread and passed in via the command queue, never computed in the
-  callback.
+  computed outside the callback and passed in via the command queue.
 
 ---
 
@@ -187,6 +214,8 @@ Real-time synthesised metronome. Not sample playback.
 - Count-in also applies when starting from a section mid-song (rehearsal), using that
   section's downbeat as the target.
 - Performance view shows a large count-in indicator with beats remaining.
+- Count-in is **skipped** on an automatic song change (§9.2) unless the incoming song
+  sets `count_in_bars > 0` and the setlist gap is long enough to contain it; see §9.2.
 
 ---
 
@@ -224,25 +253,26 @@ clean transients, or using stems (§10).
 
 ## 8. Spoken cues (TTS, offline, pre-rendered)
 
-Cues are **always TTS**. A robotic voice is acceptable and expected — the entire point is
-that restructuring a set is a text edit, never a re-recording session.
+Retained in full under the revised scope. AbleSet has no equivalent; this is the feature
+that makes restructuring a set a text edit.
 
-- Engine: **Piper**, via a prebuilt CLI sidecar (Tauri `externalBin`), invoked from the
-  worker thread — not the `piper-rs` crate. The crate was tried first and rejected: it
-  unconditionally vendors and compiles espeak-ng via `bindgen`, which requires
-  `libclang` + CMake on *every* machine that runs `cargo build`, not just at release
-  time. The sidecar CLI is instead built once, from a pinned `OHF-Voice/piper1-gpl`
-  commit (GPL-3.0), in the release job only — see `src-tauri/binaries/README.md` for
-  the pinned commit, build steps, and license-bundling details.
+Cues are **always TTS**. A robotic voice is acceptable and expected.
+
+- Engine: **Piper**, via a prebuilt CLI sidecar invoked from the worker thread — not the
+  `piper-rs` crate. The crate was tried first and rejected: it unconditionally vendors and
+  compiles espeak-ng via `bindgen`, which requires `libclang` + CMake on *every* machine
+  that runs `cargo build`, not just at release time. The sidecar CLI is instead built
+  once, from a pinned `OHF-Voice/piper1-gpl` commit (GPL-3.0), in the release job only —
+  see `src-tauri/binaries/README.md` for the pinned commit, build steps, and
+  license-bundling details.
 - Ship one voice model with the app; allow the user to point at additional `.onnx` +
   `.json` voice files in settings.
 - Cues render **at edit time, on the worker thread**. Never in the audio thread, never
   at the gig.
 - **Cache by content hash** of `(text, voice_id, speed)`. Store rendered WAVs in the
   project's `cues/` directory. Re-editing a set does not regenerate unchanged cues.
-- **Renaming a section automatically triggers regeneration of its cue.** This is the
-  feature that makes restructuring cheap — do not require a manual "render cues" step,
-  though provide one for bulk re-render.
+- **Renaming a section automatically triggers regeneration of its cue.** Do not require a
+  manual "render cues" step, though provide one for bulk re-render.
 - Cues are resampled and downmixed to project rate/mono like all other audio, then
   preloaded into memory at set-load.
 
@@ -266,17 +296,19 @@ a `loopable` one can't reliably get its full `cue_lead_beats` of lead time live:
 loopable section repeats an unknown number of times until a manual advance, so the
 following section's downbeat isn't knowable far enough ahead, and the cue instead
 starts as early as possible (from the moment the advance actually lands), the same
-too-late fallback above, every time — not just occasionally. This is a structural fact
-about the section list, not a per-render collision, so it's exposed as a field
-(`follows_loopable_section`) on `lsp_engine::cue_schedule::ScheduledCue` rather than
-left implicit here — the editor renders that field as a warning badge directly; there
-is no separate check to reimplement.
+too-late fallback above, every time — not just occasionally. This is exposed as a field
+(`follows_loopable_section`) on `lsp_engine::cue_schedule::ScheduledCue` rather than left
+implicit here — the editor renders that field as a warning badge directly.
 
 Cues route to the click/cue bus with independent gain.
 
+**Sidecar resolution.** `lsp_engine::tts` takes already-resolved paths and has no opinion
+about packaging. Under the daemon layout (§14) the sidecar binary and `resources/`
+directory sit beside the daemon executable; resolution is `current_exe().parent()`.
+
 ---
 
-## 9. Setlist and control
+## 9. Setlist, transport, and control
 
 **Setlist view:** ordered songs, each expandable into its section list. Drag to reorder
 songs and sections. Duplicate/disable a song without deleting it.
@@ -284,28 +316,108 @@ songs and sections. Duplicate/disable a song without deleting it.
 **Actions:** `arm next song`, `play`, `advance section`, `stop`, `panic stop` (immediate
 silence, all buses).
 
-**Control input:**
+### 9.1 Countdowns
+
+The performance view is a clock as much as a label. Alongside `bars_remaining`, the
+status snapshot (§3) carries **time**, derived on the audio thread from `perf_sample`
+and the resolved performance order — never accumulated, never computed in the frontend
+from a stale sample count:
+
+- `section_seconds_remaining` — until the current section's boundary.
+- `song_seconds_remaining` — until the end of the performance order.
+- `song_position_seconds` / `song_duration_seconds` — for a progress bar.
+
+Display as `M:SS`, counting down, at a size readable from three metres. During a
+`loopable` section, `song_seconds_remaining` is undefined (the repeat count is not
+knowable) — report it as `None` and have the UI show the section countdown alone rather
+than a lie.
+
+### 9.2 Auto-continue setlist
+
+Per song: `auto_continue: bool` (**default false**). Project-level: `gap_seconds: f64`
+(default 0) — silence between songs.
+
+The default is off, not on. Design principle 1 says nothing surprising happens on
+stage, and audio starting on its own when nobody asked is the surprise that matters
+most; opting a song in is one checkbox in the editor. A project migrated from schema
+v1 therefore behaves exactly as it did before the feature existed.
+
+- On reaching the end of a song's performance order with `auto_continue` set, the
+  daemon arms and plays the next **enabled** song after `gap_seconds`, instead of
+  stopping. Today end-of-song stops the transport; this is the behavioural change.
+- With `auto_continue` false, the transport stops at end of song and the next song is
+  armed but not started — the current behaviour, now an explicit per-song choice.
+- Count-in (§6) on an auto-continued song plays **inside** the gap when the gap is long
+  enough to contain it, and is skipped otherwise. It never delays the downbeat past
+  `gap_seconds`.
+- The performance view shows the gap counting down with the incoming song's title.
+- A `stop` or `panic_stop` during the gap cancels the chain, as does manually arming
+  a song or pressing play. The gap is a cancellable scheduled transition, not a
+  blocking sleep.
+- **Chaining lives in the host, not the audio thread and not the frontend.** It loads
+  the next song's audio, which is I/O (invariant 1); and a frontend timer stops firing
+  when the webview is backgrounded or the screen sleeps. See `setlist_driver.rs`.
+- A natural end and a human stop both reach `TransportState::Stopped`, and the
+  `Stopping` ramp that distinguishes them is too brief (5–10 ms) to detect reliably by
+  polling. Intent is therefore recorded explicitly: every human transport action bumps
+  a chain epoch *before* its command reaches the engine, and a pending chain fires only
+  if its captured epoch is still current. Missing a stop must never start a song.
+
+### 9.3 Control input
 
 - **Keyboard shortcuts** for every action, always available.
 - **MIDI input** via `midir` for a USB footswitch, with **MIDI learn**: enter learn mode,
   press the pedal, capture whatever it sends (note on, CC, program change) and bind it.
   Cheap footswitches send wildly inconsistent messages; do not hardcode any mapping.
 - Debounce MIDI triggers (~150 ms) — footswitches bounce.
-- Identical behaviour on Linux and Windows.
 - Note: many pedals present as USB HID keyboards rather than MIDI. Keyboard shortcut
   support covers those for free.
+- MIDI is owned by the daemon, not the browser. The Web MIDI API is not used.
 
-**Performance view** — the primary screen during a gig, and as important as the audio:
+### 9.4 Performance view
+
+The primary screen during a gig, and as important as the audio:
 
 - Current song title.
 - Current section name, very large.
-- **Bars remaining until the next section**, counting down.
+- **Bars remaining** until the next section, counting down.
+- **Time remaining** in section and song (§9.1), plus a song progress bar.
 - Next section name (and queued-section indicator when an advance is pending).
-- Count-in indicator.
+- Count-in indicator; inter-song gap countdown (§9.2).
 - Device status / error banner.
 
 High contrast, readable from three metres under stage lighting. Optimise this view for a
 glance, not for information density.
+
+### 9.5 Daemon and HTTP API
+
+The application is a single Rust binary that owns audio, MIDI, project state, and config,
+and serves the frontend and its API over HTTP on `127.0.0.1` (port configurable,
+persisted in app config).
+
+- **Static bundle:** the built Svelte app is served from the daemon, embedded in the
+  binary or read from a directory beside it. The frontend is a static SPA — no SSR, no
+  Node runtime at any point.
+- **`/api/*`:** a REST surface mirroring the existing command set one-for-one (transport,
+  project, device, MIDI, cues). Commands are already thin wrappers over engine calls;
+  this replaces the attribute layer, not the logic.
+- **`/api/events`:** a Server-Sent Events stream pushing the §3 status snapshot at ~30 Hz.
+  Replaces UI polling — one connection, server-paced, and it is the same mechanism the
+  deferred LAN remote (§15) will use for multiple clients.
+- **Binding:** `127.0.0.1` only, for now. Widening to `0.0.0.0` is deliberately *not*
+  done until §15 brings authentication with it.
+- **No native dialogs.** File and folder selection is a server-side browse endpoint
+  (`GET /api/browse?path=`) returning directory listings, not a GTK file picker. This
+  works identically for a local browser and a remote one, and removes a desktop
+  toolkit dependency.
+- **Config:** `$XDG_CONFIG_HOME/live-set-player/config.json` (falling back to
+  `~/.config`). Device selection, MIDI bindings, port, and custom voices live here —
+  never in project data.
+
+**The frontend holds no authority.** It sends requests and renders snapshots. It must
+remain correct if a second client connects and changes something — state lives in the
+daemon, and every mutation is reflected back through `/api/events` or a refetch, not
+assumed locally.
 
 ---
 
@@ -338,7 +450,9 @@ MySet.lsp/
 - All paths in `project.json` are **relative to the project folder**.
 - Store a hash and frame count per audio file; on load, verify and warn clearly if a file
   is missing or has changed (re-exported backtrack).
-- `project.json` carries a schema version. Write a migration path from day one.
+- `project.json` carries a schema version. Adding `auto_continue` (§9.2) and
+  `gap_seconds` is a schema bump with a migration, not a silent `#[serde(default)]` —
+  the migration path exists from day one and this is its first real use.
 - Device selection is app config, not project data.
 
 ---
@@ -350,33 +464,61 @@ performance order — to a stereo WAV, bus 0 to left and bus 1 to right.
 
 This is the only realistic way to verify click alignment and cue timing without booking a
 gig. Import the result into Reaper against the source backtrack and check the click sits
-on the grid. Build this early; it is the test harness for everything else.
+on the grid.
 
-Expose it both as a CLI flag and a UI button.
+Expose it as a CLI subcommand of the daemon binary (`live-set-player render …`) and as a
+UI button that calls the equivalent API endpoint.
 
 ---
 
-## 13. Build order
+## 13. Build order (revised)
 
-1. **Test harness + timeline model.** Timeline maths (§2) with unit tests asserting no
-   drift over 10+ minutes at non-integer BPMs. Offline render (§12).
-2. **Audio engine core.** Device selection and sample-rate handling (§1), single-file
-   backtrack playback, bar-accurate section markers, seamless looping with crossfade (§7),
-   one shared clock, real-time discipline (§3).
-3. **Click synth** (§5) locked to the same clock, plus count-in (§6).
-4. **Piper cue rendering** (§8) — cache, auto-regenerate on rename, end-anchored
-   scheduling.
-5. **Minimal UI.** Load song, define sections by bar count, set loop flags, hit play.
-   Performance view (§9).
-6. **MIDI learn + footswitch + full setlist UI** (§9).
-7. **Stems and EQ** (§10, §4) — additive, only once 1–6 are solid.
+Phases 1–6 of the original build order are **complete**: timeline model, audio engine
+core, click synth, count-in, Piper cues, editor/performance UI, and MIDI learn all exist
+and are tested. The work below is what the scope change adds.
+
+1. ~~**Re-spec.** This document and `CLAUDE.md`.~~ **Done.**
+2. **Daemon shell.** New HTTP binary: static bundle + `/api/*` + `/api/events` (§9.5).
+   Port the existing command handlers across unchanged; replace the native file dialog
+   with `/api/browse`; replace resource-directory lookups with `current_exe()`-relative
+   paths; move config to XDG. Remove the desktop-shell dependency.
+3. **Frontend to HTTP.** Replace invoke calls with `fetch`; replace status polling with
+   an SSE subscription. Build to a static bundle.
+4. ~~**Countdowns** (§9.1).~~ **Done** — status snapshot extended, readouts and progress
+   bar in the performance view, covered by `engine/tests/countdowns.rs`.
+5. ~~**Auto-continue** (§9.2).~~ **Done** — v1→v2 schema migration, `setlist_driver.rs`,
+   editor controls. Still outstanding: the gap countdown in the performance view.
+6. **Packaging** (§14).
+
+**Note on ordering.** Steps 4 and 5 were built against the existing Tauri shell rather
+than waiting for step 2, to meet a performance date. They are shell-agnostic — the
+countdowns are engine-side and the driver is a plain thread over `AppState` — so the
+daemon migration ports them rather than redoing them.
+
+Deferred work (§0) is not in this list by design.
 
 ---
 
 ## 14. Build and distribution
 
-- Build each platform on its own runner. **Do not attempt to cross-compile Windows from
-  Linux** — Tauri's own documentation calls this a last resort that is not well tested.
-- Use a GitHub Actions matrix (`ubuntu-22.04`, `windows-latest`) with `tauri-action`.
-- Linux: AppImage and `.deb`. Windows: NSIS `.exe`.
-- Ship the Piper voice model as a bundled resource.
+Linux-first, minimal footprint.
+
+- Output is **one binary** plus its static assets, the Piper sidecar, and voice
+  resources. No webview runtime, no Node, no desktop toolkit dependency in the run path.
+- Launch opens the default browser at the local URL, or the user pins a
+  `chromium --app=http://127.0.0.1:PORT` launcher. Ship a `.desktop` entry doing the
+  latter.
+- Distribute as a tarball and/or AppImage built on Linux CI. No cross-compilation.
+- Ship the Piper voice model and `espeak-ng-data` alongside the binary; GPL-3.0 license
+  bundling for the sidecar is unchanged (`src-tauri/binaries/README.md`).
+- Windows packaging is deferred with Windows support (§0, §1).
+
+---
+
+## 15. Deferred: LAN remote
+
+Recorded here so the current architecture stays compatible with it, **not** as current
+work. When it happens it should be: bind `0.0.0.0`, add a shared-secret or pairing
+auth, allow multiple concurrent SSE subscribers, and make every mutation idempotent and
+broadcast. §9.5's "the frontend holds no authority" rule is what makes that possible
+without reworking the UI.

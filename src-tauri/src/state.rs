@@ -7,6 +7,7 @@ use lsp_engine::project::Project;
 use lsp_engine::rt::EngineHandle;
 use lsp_engine::tts::{PiperSidecar, VoicePaths};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
@@ -34,6 +35,12 @@ pub struct AppState {
     /// report engine rate/channels/notice without round-tripping the audio host.
     pub last_open: Mutex<Option<OpenReport>>,
     pub midi_tx: Sender<MidiHostMsg>,
+    /// §9.2: bumped by every *human* transport action (play, stop, panic stop,
+    /// arming a song) before the command reaches the engine. The setlist driver
+    /// captures it when a song ends naturally and refuses to start the next song if
+    /// it has changed since — so a stop during the inter-song gap always wins,
+    /// with no dependence on poll timing.
+    pub chain_epoch: Arc<AtomicU64>,
     /// Shared with the `midir` message callback running on the MIDI host thread
     /// (§9) -- it locks this on every incoming message to route/debounce or, in
     /// learn mode, to capture a new binding.

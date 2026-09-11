@@ -13,9 +13,37 @@ use lsp_engine::loader;
 use lsp_engine::midi::Action;
 use lsp_engine::project::Song;
 use lsp_engine::rt::{Command, Status};
+use std::sync::atomic::Ordering;
 use tauri::State;
 
 use crate::state::AppState;
+
+/// §9.2: mark a human transport action, cancelling any auto-continue the setlist
+/// driver has pending. Called *before* the command is sent, so the driver can never
+/// observe a stale epoch and start the next song after a stop.
+fn cancel_pending_chain(state: &AppState) {
+    state.chain_epoch.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Non-mutating status read for the setlist driver (`setlist_driver.rs`). `None`
+/// when no device is open or the engine has not published a snapshot yet.
+pub fn peek_status(state: &AppState) -> Option<Status> {
+    let mut guard = state.engine.lock().unwrap();
+    guard.as_mut()?.latest_status()
+}
+
+/// Arm the next enabled song on behalf of the setlist driver. Deliberately does
+/// **not** bump the chain epoch: this is the chain continuing, not a human
+/// overriding it.
+pub fn arm_next_song_for_chain(state: &AppState) -> Result<Option<Song>, String> {
+    arm_next_song_impl(state)
+}
+
+/// Start playback on behalf of the setlist driver. Same reasoning as
+/// [`arm_next_song_for_chain`] — no epoch bump.
+pub fn play_for_chain(state: &AppState) -> Result<(), String> {
+    send_command(state, Command::Play)
+}
 
 fn send_command(state: &AppState, cmd: Command) -> Result<(), String> {
     let mut guard = state.engine.lock().unwrap();
@@ -58,14 +86,17 @@ pub fn get_status(state: State<AppState>) -> Option<Status> {
 }
 
 fn dispatch_play(state: &AppState) -> Result<(), String> {
+    cancel_pending_chain(state);
     send_command(state, Command::Play)
 }
 
 fn dispatch_stop(state: &AppState) -> Result<(), String> {
+    cancel_pending_chain(state);
     send_command(state, Command::Stop)
 }
 
 fn dispatch_panic_stop(state: &AppState) -> Result<(), String> {
+    cancel_pending_chain(state);
     send_command(state, Command::PanicStop)
 }
 
@@ -74,6 +105,7 @@ fn dispatch_advance_section(state: &AppState) -> Result<(), String> {
 }
 
 fn dispatch_arm_next_song(state: &AppState) -> Result<(), String> {
+    cancel_pending_chain(state);
     arm_next_song_impl(state).map(|_| ())
 }
 
@@ -189,6 +221,7 @@ fn arm_song_impl(state: &AppState, song_id: &str) -> Result<Song, String> {
 /// Load `song_id`'s audio and arm its first section, ready for `play`.
 #[tauri::command]
 pub fn arm_song(state: State<AppState>, song_id: String) -> Result<Song, String> {
+    cancel_pending_chain(&state);
     arm_song_impl(&state, &song_id)
 }
 
@@ -216,5 +249,6 @@ fn arm_next_song_impl(state: &AppState) -> Result<Option<Song>, String> {
 
 #[tauri::command]
 pub fn arm_next_song(state: State<AppState>) -> Result<Option<Song>, String> {
+    cancel_pending_chain(&state);
     arm_next_song_impl(&state)
 }

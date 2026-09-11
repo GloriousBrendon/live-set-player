@@ -34,13 +34,25 @@ pub const MIN_BUFFER_FRAMES: u32 = 512;
 
 /// Enumerate output device names on the default host (WASAPI on Windows,
 /// ALSA/PipeWire on Linux). The name is the §1 persistence key.
+///
+/// **De-duplicated, in first-seen order.** ALSA routinely enumerates the same card
+/// many times over (one entry per sub-device/plugin configuration) — a typical
+/// desktop reports ~49 devices under ~23 distinct names, with a single analog output
+/// appearing 15 times. Since the persistence key is the *name* and
+/// [`find_output_device`] resolves a name to the **first** device bearing it, showing
+/// the duplicates would offer the user choices that are not distinguishable by the
+/// thing we actually store, and all but the first of which are unreachable. Listing
+/// each name once keeps the picker honest: every entry it offers is an entry
+/// `find_output_device` can actually return.
 pub fn list_output_devices() -> Result<Vec<String>, DeviceError> {
     let host = cpal::default_host();
     let devices = host
         .output_devices()
         .map_err(|e| DeviceError::Backend(e.to_string()))?;
+    let mut seen = std::collections::HashSet::new();
     Ok(devices
         .filter_map(|d| d.description().ok().map(|desc| desc.name().to_string()))
+        .filter(|name| seen.insert(name.clone()))
         .collect())
 }
 

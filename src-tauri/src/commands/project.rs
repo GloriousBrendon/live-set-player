@@ -63,6 +63,7 @@ pub fn new_project(
         bus_layout: BusLayout::default(),
         click: ClickConfig::default(),
         cue: CueConfig::default(),
+        gap_seconds: 0.0,
         songs: vec![],
     };
     project.validate().map_err(|e| e.to_string())?;
@@ -92,6 +93,7 @@ pub fn update_project_settings(
     click: ClickConfig,
     cue: CueConfig,
     bus_layout: BusLayout,
+    gap_seconds: f64,
 ) -> Result<Project, String> {
     let mut guard = state.project.lock().unwrap();
     let ps = guard.as_mut().ok_or("no project loaded")?;
@@ -100,6 +102,7 @@ pub fn update_project_settings(
     ps.project.click = click;
     ps.project.cue = cue;
     ps.project.bus_layout = bus_layout;
+    ps.project.gap_seconds = gap_seconds;
     if let Err(e) = ps.project.validate() {
         ps.project = previous;
         return Err(e.to_string());
@@ -138,6 +141,7 @@ pub fn add_song(state: State<AppState>) -> Result<Song, String> {
         sections: vec![],
         tracks: vec![],
         disabled: false,
+        auto_continue: false,
     };
     ps.project.songs.push(song.clone());
     Ok(song)

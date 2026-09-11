@@ -395,6 +395,7 @@ mod tests {
                 gain_db: 0.0,
             },
             cue: CueConfig::default(),
+            gap_seconds: 0.0,
             songs: vec![],
         }
     }
@@ -430,6 +431,7 @@ mod tests {
                 downmix: DownmixMode::Sum,
                 kind: TrackKind::Backtrack,
             }],
+            auto_continue: false,
             disabled: false,
         }
     }

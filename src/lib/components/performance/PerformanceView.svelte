@@ -36,6 +36,18 @@
 	});
 
 	const countingIn = $derived($status?.count_in_beats_remaining != null);
+
+	/** M:SS, floored, clamped at zero. Negative input (count-in) reads 0:00. */
+	function mmss(seconds: number): string {
+		const t = Math.max(0, Math.floor(seconds));
+		return `${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}`;
+	}
+
+	const songProgress = $derived.by(() => {
+		const d = $status?.song_duration_seconds ?? 0;
+		if (d <= 0) return 0;
+		return Math.min(1, Math.max(0, ($status?.song_position_seconds ?? 0) / d));
+	});
 </script>
 
 <div class="performance">
@@ -54,6 +66,20 @@
 		<div class="bars-remaining">
 			<span class="bars-number">{$status?.bars_remaining}</span>
 			<span class="bars-label">bars remaining</span>
+			<span class="section-time">{mmss($status?.section_seconds_remaining ?? 0)}</span>
+		</div>
+
+		<div class="song-time">
+			<div class="song-bar"><div class="song-bar-fill" style:width="{songProgress * 100}%"></div></div>
+			<div class="song-time-row">
+				<span>{mmss($status?.song_position_seconds ?? 0)}</span>
+				{#if $status?.song_seconds_remaining != null}
+					<span class="song-left">−{mmss($status.song_seconds_remaining)} left</span>
+				{:else}
+					<span class="song-left song-left-unknown">looping</span>
+				{/if}
+				<span>{mmss($status?.song_duration_seconds ?? 0)}</span>
+			</div>
 		</div>
 
 		<div class="next-section">
@@ -126,6 +152,47 @@
 		color: #9fb3c8;
 		text-transform: uppercase;
 		letter-spacing: 0.04em;
+	}
+	.section-time {
+		font-size: 6.5vh;
+		font-weight: 700;
+		color: #ffffff;
+		font-variant-numeric: tabular-nums;
+		margin-left: 1.5vw;
+	}
+	.song-time {
+		width: 70vw;
+		display: flex;
+		flex-direction: column;
+		gap: 0.8vh;
+	}
+	.song-bar {
+		height: 1.2vh;
+		background: #1c2733;
+		border-radius: 0.6vh;
+		overflow: hidden;
+	}
+	.song-bar-fill {
+		height: 100%;
+		background: #ffd60a;
+		border-radius: 0.6vh;
+	}
+	.song-time-row {
+		display: flex;
+		justify-content: space-between;
+		align-items: baseline;
+		font-size: 2.6vh;
+		color: #9fb3c8;
+		font-variant-numeric: tabular-nums;
+	}
+	.song-left {
+		font-weight: 700;
+		color: #cfd8e3;
+	}
+	.song-left-unknown {
+		color: #6d7f91;
+		text-transform: uppercase;
+		letter-spacing: 0.08em;
 	}
 	.next-section {
 		display: flex;

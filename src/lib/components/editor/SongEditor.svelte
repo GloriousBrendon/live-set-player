@@ -217,6 +217,10 @@
 				<input type="checkbox" bind:checked={draft.disabled} onchange={touch} />
 				Disabled
 			</label>
+			<label class="disabled-toggle" title="At the end of this song, arm and play the next enabled song automatically, after the project's inter-song gap.">
+				<input type="checkbox" bind:checked={draft.auto_continue} onchange={touch} />
+				Auto-continue
+			</label>
 		</div>
 
 		<div class="grid">

@@ -69,6 +69,8 @@ export interface Song {
 	sections: Section[];
 	tracks: Track[];
 	disabled: boolean;
+	/** Chain into the next enabled song at end of song (§9.2). Defaults off. */
+	auto_continue: boolean;
 }
 
 export interface Project {
@@ -78,6 +80,8 @@ export interface Project {
 	bus_layout: BusLayout;
 	click: ClickConfig;
 	cue: CueConfig;
+	/** Silence between songs when one auto-continues into the next (§9.2). */
+	gap_seconds: number;
 	songs: Song[];
 }
 
@@ -111,6 +115,13 @@ export interface Status {
 	section: number;
 	queued: QueuedStatus;
 	bars_remaining: number;
+	/** Seconds until the current section's end (§9.1). */
+	section_seconds_remaining: number;
+	/** Performance position in seconds; negative during a count-in. */
+	song_position_seconds: number;
+	song_duration_seconds: number;
+	/** null when a loopable section is active or ahead — the end isn't knowable. */
+	song_seconds_remaining: number | null;
 	count_in_beats_remaining: number | null;
 	engine_rate: number;
 	song_loaded: boolean;

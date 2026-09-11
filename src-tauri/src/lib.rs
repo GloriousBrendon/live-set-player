@@ -1,11 +1,13 @@
 mod audio_host;
 mod commands;
 mod midi_host;
+mod setlist_driver;
 mod sidecar;
 mod state;
 
 use audio_host::AudioHostMsg;
 use state::AppState;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use tauri::Manager;
 
@@ -64,6 +66,7 @@ pub fn run() {
                 voices: Mutex::new(voices),
                 last_open,
                 midi_tx,
+                chain_epoch: Arc::new(AtomicU64::new(0)),
                 midi,
             });
 
@@ -71,6 +74,12 @@ pub fn run() {
             // startup is not a refusal -- keyboard shortcuts remain fully functional
             // without it, so this is best-effort and silently no-ops on failure.
             commands::midi::reopen_configured_port(&handle, app.state::<AppState>().inner());
+
+            // §9.2: watches for a song ending naturally and chains into the next one
+            // when that song opted in. Host-side, never the audio thread (chaining
+            // loads audio) and never the frontend (a backgrounded webview throttles
+            // its timers).
+            setlist_driver::spawn(handle.clone());
 
             Ok(())
         })

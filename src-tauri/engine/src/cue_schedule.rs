@@ -203,6 +203,7 @@ mod tests {
                 },
             ],
             tracks: Vec::<Track>::new(),
+            auto_continue: false,
             disabled: false,
         }
     }

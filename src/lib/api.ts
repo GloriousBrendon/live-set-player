@@ -53,8 +53,9 @@ export const updateProjectSettings = (
 	name: string,
 	click: ClickConfig,
 	cue: CueConfig,
-	busLayout: BusLayout
-) => invoke<Project>('update_project_settings', { name, click, cue, busLayout });
+	busLayout: BusLayout,
+	gapSeconds: number
+) => invoke<Project>('update_project_settings', { name, click, cue, busLayout, gapSeconds });
 export const addSong = () => invoke<Song>('add_song');
 export const removeSong = (songIndex: number) => invoke<void>('remove_song', { songIndex });
 export const reorderSongs = (newOrder: number[]) =>

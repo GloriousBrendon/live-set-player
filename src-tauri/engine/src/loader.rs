@@ -569,6 +569,7 @@ mod tests {
             bus_layout: Default::default(),
             click: Default::default(),
             cue: Default::default(),
+            gap_seconds: 0.0,
             songs: vec![Song {
                 id: "song1".to_string(),
                 title: "Disaster Kind".to_string(),
@@ -592,6 +593,7 @@ mod tests {
                     downmix: DownmixMode::Sum,
                     kind: Default::default(),
                 }],
+                auto_continue: false,
                 disabled: false,
             }],
         }

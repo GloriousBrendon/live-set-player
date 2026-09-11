@@ -41,6 +41,7 @@
 	let click = $state<ClickConfig>({ bus: 1, gain_db: 0 });
 	let cue = $state<CueConfig>({ voice_id: '', speed: 1, gain_db: 0, bus: 1 });
 	let busLayout = $state<BusLayout>({ buses: [] });
+	let gapSeconds = $state(0);
 	let lastProjectRef: unknown = null;
 
 	$effect(() => {
@@ -49,13 +50,14 @@
 			click = { ...$project.click };
 			cue = { ...$project.cue };
 			busLayout = { buses: $project.bus_layout.buses.map((b) => ({ ...b })) };
+			gapSeconds = $project.gap_seconds;
 			lastProjectRef = $project;
 		}
 	});
 
 	const commit = debounce(async () => {
 		try {
-			const updated = await api.updateProjectSettings(name, click, cue, busLayout);
+			const updated = await api.updateProjectSettings(name, click, cue, busLayout, gapSeconds);
 			lastProjectRef = updated;
 			project.set(updated);
 		} catch (err) {
@@ -91,6 +93,14 @@
 					Name
 					<input type="text" bind:value={name} oninput={commit} />
 				</label>
+				<label>
+					Gap between songs (seconds)
+					<input type="number" min="0" step="0.5" bind:value={gapSeconds} oninput={commit} />
+				</label>
+				<p class="hint">
+					Silence inserted before an auto-continuing song starts. Only applies to songs with
+					&ldquo;Auto-continue&rdquo; switched on.
+				</p>
 			</div>
 
 			<div class="group">
@@ -180,6 +190,12 @@
 </div>
 
 <style>
+	.hint {
+		margin: 0.4em 0 0;
+		font-size: 0.85em;
+		opacity: 0.7;
+		line-height: 1.4;
+	}
 	.panel {
 		border: 1px solid #2a2f36;
 		border-radius: 0.4rem;

@@ -751,6 +751,7 @@ mod tests {
                 },
             ],
             tracks: vec![],
+            auto_continue: false,
             disabled: false,
         };
         let order = [PerformanceEntry::once(1), PerformanceEntry::once(0)];

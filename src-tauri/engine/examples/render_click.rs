@@ -188,6 +188,7 @@ fn main() {
             gain_db: 0.0,
         },
         cue: CueConfig::default(),
+        gap_seconds: 0.0,
         songs: vec![],
     };
 
@@ -243,6 +244,7 @@ fn main() {
         accent_pattern: vec![],
         sections,
         tracks: vec![make_track(0)],
+        auto_continue: false,
         disabled: false,
     };
 

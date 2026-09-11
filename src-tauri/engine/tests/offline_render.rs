@@ -52,6 +52,7 @@ fn project(sample_rate: u32) -> Project {
             gain_db: 0.0,
         },
         cue: CueConfig::default(),
+        gap_seconds: 0.0,
         songs: vec![],
     }
 }
@@ -96,6 +97,7 @@ fn single_section_song(
             cue_lead_beats: 4,
         }],
         tracks: vec![backtrack_track()],
+        auto_continue: false,
         disabled: false,
     }
 }
@@ -146,6 +148,7 @@ fn four_section_song(bpm: f64, ts: TimeSignature) -> Song {
             },
         ],
         tracks: vec![backtrack_track()],
+        auto_continue: false,
         disabled: false,
     }
 }
@@ -703,6 +706,7 @@ fn short_and_long_cues_finish_the_same_distance_before_their_downbeats_in_a_real
             },
         ],
         tracks: vec![backtrack_track()],
+        auto_continue: false,
         disabled: false,
     };
 

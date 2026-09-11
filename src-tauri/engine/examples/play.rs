@@ -266,6 +266,7 @@ fn main() {
         bus_layout: BusLayout::default(),
         click: ClickConfig::default(),
         cue: CueConfig::default(),
+        gap_seconds: 0.0,
         songs: vec![],
     };
     let song = Song {
@@ -294,6 +295,7 @@ fn main() {
             downmix: DownmixMode::Sum,
             kind: TrackKind::Backtrack,
         }],
+        auto_continue: false,
         disabled: false,
     };
 

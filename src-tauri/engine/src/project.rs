@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 
 /// Current `project.json` schema version. Bump this and add a case to
 /// [`migrate::upgrade`] whenever the format changes.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// - **v2** added `Project::gap_seconds` and `Song::auto_continue` (§9.2).
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Project {
@@ -27,6 +29,10 @@ pub struct Project {
     pub click: ClickConfig,
     #[serde(default)]
     pub cue: CueConfig,
+    /// Silence inserted between songs when one auto-continues into the next (§9.2).
+    /// Project-wide; the per-song switch is [`Song::auto_continue`].
+    #[serde(default)]
+    pub gap_seconds: f64,
     #[serde(default)]
     pub songs: Vec<Song>,
 }
@@ -40,6 +46,12 @@ impl Project {
             return Err(ProjectError::Validation(format!(
                 "sample_rate must be 44100 or 48000, got {}",
                 self.sample_rate
+            )));
+        }
+        if !self.gap_seconds.is_finite() || self.gap_seconds < 0.0 {
+            return Err(ProjectError::Validation(format!(
+                "gap_seconds must be finite and non-negative, got {}",
+                self.gap_seconds
             )));
         }
         let bus_count = self.bus_layout.buses.len();
@@ -180,6 +192,15 @@ pub struct Song {
     pub tracks: Vec<Track>,
     #[serde(default)]
     pub disabled: bool,
+    /// When true, reaching the end of this song's performance order arms and plays
+    /// the next enabled song after `Project::gap_seconds`, instead of stopping (§9.2).
+    ///
+    /// **Defaults to false.** §9.2 describes the chaining behaviour; the default is
+    /// off because design principle 1 is that nothing surprising happens on stage —
+    /// audio should never start playing unless a human asked for it. Turning it on is
+    /// one checkbox per song in the editor.
+    #[serde(default)]
+    pub auto_continue: bool,
 }
 
 fn default_count_in_bars() -> u32 {
@@ -347,14 +368,42 @@ pub mod migrate {
     use super::ProjectError;
     use serde_json::Value;
 
-    pub fn upgrade(value: Value, from_version: u32) -> Result<Value, ProjectError> {
-        match from_version {
-            v if v == super::SCHEMA_VERSION => Ok(value),
-            other => Err(ProjectError::Validation(format!(
-                "no migration path from schema_version {other} to {}",
-                super::SCHEMA_VERSION
-            ))),
+    pub fn upgrade(mut value: Value, from_version: u32) -> Result<Value, ProjectError> {
+        let mut version = from_version;
+        // Each arm upgrades by exactly one step and falls through to the next, so a
+        // v1 file reaching a future v4 runs 1->2, 2->3, 3->4 in order.
+        if version == 1 {
+            v1_to_v2(&mut value)?;
+            version = 2;
         }
+        if version == super::SCHEMA_VERSION {
+            Ok(value)
+        } else {
+            Err(ProjectError::Validation(format!(
+                "no migration path from schema_version {from_version} to {}",
+                super::SCHEMA_VERSION
+            )))
+        }
+    }
+
+    /// v1 -> v2 (§9.2): adds `gap_seconds` at the project level and `auto_continue`
+    /// per song. Both are written explicitly rather than left to serde's defaults so
+    /// that re-saving a migrated project produces a file that states its settings
+    /// outright, and so the `schema_version` bump is never the only visible change.
+    fn v1_to_v2(value: &mut Value) -> Result<(), ProjectError> {
+        let obj = value
+            .as_object_mut()
+            .ok_or_else(|| ProjectError::Validation("project.json is not an object".into()))?;
+        obj.entry("gap_seconds").or_insert_with(|| Value::from(0.0));
+        if let Some(songs) = obj.get_mut("songs").and_then(|s| s.as_array_mut()) {
+            for song in songs {
+                if let Some(song) = song.as_object_mut() {
+                    song.entry("auto_continue").or_insert(Value::Bool(false));
+                }
+            }
+        }
+        obj.insert("schema_version".into(), Value::from(2u32));
+        Ok(())
     }
 }
 
@@ -390,7 +439,9 @@ mod tests {
     fn parses_minimal_project_and_applies_section_defaults() {
         let json = minimal_project_json().to_string();
         let project = load_project_json(&json).unwrap();
-        assert_eq!(project.schema_version, 1);
+        // The fixture is a v1 document; loading migrates it forward, so the parsed
+        // value carries the current version, not the on-disk one.
+        assert_eq!(project.schema_version, SCHEMA_VERSION);
         assert_eq!(project.songs.len(), 1);
         let song = &project.songs[0];
         assert_eq!(song.offset_samples, 0);
@@ -407,6 +458,54 @@ mod tests {
         assert_eq!(project.bus_layout.buses[1].name, "Click/Cues");
         assert!(!project.bus_layout.buses[1].limiter_enabled);
         assert_eq!(project.click.bus, 1);
+    }
+
+    /// §9.2 / §11: a v1 project on disk migrates to v2, gaining `gap_seconds` and a
+    /// per-song `auto_continue` that both default to "nothing happens automatically".
+    #[test]
+    fn migrates_v1_to_v2_adding_auto_continue_defaults() {
+        let json = minimal_project_json().to_string();
+        let project = load_project_json(&json).unwrap();
+        assert_eq!(project.schema_version, 2);
+        assert_eq!(project.gap_seconds, 0.0);
+        assert!(
+            !project.songs[0].auto_continue,
+            "a migrated song must not start chaining on its own"
+        );
+    }
+
+    /// The migration writes the new fields explicitly, so a migrated document is a
+    /// complete v2 document rather than one relying on serde defaults to re-read.
+    #[test]
+    fn v1_to_v2_migration_writes_fields_explicitly() {
+        let upgraded = migrate::upgrade(minimal_project_json(), 1).unwrap();
+        assert_eq!(upgraded["schema_version"], 2);
+        assert_eq!(upgraded["gap_seconds"], 0.0);
+        assert_eq!(upgraded["songs"][0]["auto_continue"], false);
+    }
+
+    /// A v2 document round-trips unchanged, and an explicitly-set `auto_continue`
+    /// survives rather than being reset by the migration's `or_insert`.
+    #[test]
+    fn v2_document_round_trips_and_preserves_auto_continue() {
+        let mut value = minimal_project_json();
+        value["schema_version"] = serde_json::json!(2);
+        value["gap_seconds"] = serde_json::json!(2.5);
+        value["songs"][0]["auto_continue"] = serde_json::json!(true);
+        let project = load_project_json(&value.to_string()).unwrap();
+        assert_eq!(project.gap_seconds, 2.5);
+        assert!(project.songs[0].auto_continue);
+        let reparsed = load_project_json(&to_project_json(&project).unwrap()).unwrap();
+        assert_eq!(reparsed, project);
+    }
+
+    #[test]
+    fn rejects_negative_gap_seconds() {
+        let mut value = minimal_project_json();
+        value["schema_version"] = serde_json::json!(2);
+        value["gap_seconds"] = serde_json::json!(-1.0);
+        let project = load_project_json(&value.to_string()).unwrap();
+        assert!(project.validate().is_err());
     }
 
     #[test]

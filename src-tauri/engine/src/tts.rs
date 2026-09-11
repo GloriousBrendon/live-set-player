@@ -394,6 +394,7 @@ mod tests {
                 cue_lead_beats: 4,
             }],
             tracks: Vec::<Track>::new(),
+            auto_continue: false,
             disabled: false,
         };
         let before = cache_key(effective_cue_text(&song.sections[0]), "voice-a", 1.0);
@@ -460,6 +461,7 @@ mod tests {
             bus_layout: Default::default(),
             click: Default::default(),
             cue: CueConfig::default(), // voice_id left empty
+            gap_seconds: 0.0,
             songs: vec![Song {
                 id: "s1".into(),
                 title: "Song".into(),
@@ -477,6 +479,7 @@ mod tests {
                     cue_lead_beats: 4,
                 }],
                 tracks: Vec::<Track>::new(),
+                auto_continue: false,
                 disabled: false,
             }],
         };

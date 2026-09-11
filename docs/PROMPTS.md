@@ -1,5 +1,11 @@
 # Claude Code Session Prompts — Live Set Player
 
+> **Historical.** This file records the original phase 1–8 build, which took the project
+> through the timeline model, audio engine, click, count-in, TTS cues, editor/performance
+> UI, and MIDI learn. The scope has since changed (AbleSet-style setlist player, Linux
+> daemon, no Tauri shell). **`docs/SPEC.md` §13 is the current build order**; the phases
+> and the "Development platform: Windows" note below no longer describe current work.
+
 One session per phase. Do not run two phases in one session — long sessions compact,
 and compaction is where architectural decisions get quietly forgotten.
 

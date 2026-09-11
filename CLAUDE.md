@@ -1,9 +1,17 @@
 # Live Set Player
 
-Desktop app for live band performance playback (backing tracks, generated click,
-TTS cues). Tauri 2 + Rust + Svelte. Targets Linux and Windows.
+An AbleSet-style setlist player that does its own audio — backing tracks, generated
+click, TTS cues — with no Ableton Live or DAW underneath it. Rust daemon (audio + HTTP)
+serving a Svelte frontend. Linux-first, minimal footprint.
 
-**Full specification: `docs/SPEC.md`. Read it before starting any task.**
+**Full specification: `docs/SPEC.md`. Read it before starting any task.** The scope was
+revised; SPEC.md §0 lists what is a permanent non-goal versus what is merely deferred,
+and §13 is the current build order. `docs/PROMPTS.md` is a historical record of the
+original phases 1–6 and does not describe current work.
+
+**Migration in progress.** The shell is being moved from Tauri to a headless HTTP daemon
+(SPEC.md §9.5). Until that lands, `src-tauri/` still holds a Tauri app; the engine at
+`src-tauri/engine/` is unaffected and has never depended on Tauri.
 
 ## Invariants
 
@@ -36,6 +44,11 @@ and sounds fine on your machine.
 6. **Every playhead jump gets a 15 ms equal-power crossfade.** Loops and section
    advances are audio splices.
 
+7. **The frontend holds no authority.** It sends requests and renders status snapshots;
+   the daemon owns audio, project state, and config. Never cache authoritative state in
+   the UI or compute timing there from a stale sample count — it must stay correct when
+   a second client connects (SPEC.md §9.5).
+
 ## Priorities
 
 Stability > correctness of timing > features > latency. There is no live input
@@ -51,8 +64,9 @@ immunity, not low latency.
 - The audio engine is a standalone library crate at `src-tauri/engine/` (package
   `lsp-engine`, a workspace member of `src-tauri/`), with no Tauri dependency, so it
   can be unit tested and driven headlessly by the offline renderer.
-- Frontend: Svelte + TypeScript. The UI never touches engine state directly; it
-  sends commands and reads a status snapshot.
+- Frontend: Svelte + TypeScript, built to a static bundle served by the daemon. No SSR,
+  no Node in the run path. The UI never touches engine state directly; it calls `/api/*`
+  and subscribes to the `/api/events` status stream.
 - Prefer small, testable commits. Run the drift tests after any change to timing code.
 
 ## Verification
@@ -65,4 +79,9 @@ left and click/cues right for inspection in a DAW.
 ## Out of scope
 
 No plugin hosting. No waveform editor. No time-stretching or warping. No recording.
-Do not add these even if they seem helpful.
+No Ableton Live integration, Link sync, or `.als` parsing — not needing them is the
+point. Do not add these even if they seem helpful.
+
+Separately **deferred, not forbidden** (SPEC.md §0): LAN remote UI, lyrics, OSC,
+per-role performance layouts, Windows support. Don't build them yet; don't design
+them out either.

@@ -80,6 +80,18 @@ pub struct SongMeta {
     /// This song's own count-in length (§6), already clamped to 0-4 bars. Used by
     /// `cmd_play` unless overridden — see [`Command::SetCountInOverride`].
     pub count_in_bars: u32,
+    /// Exclusive performance-time end of the full section order, in samples (§9.1).
+    /// Precomputed here, off the audio thread, straight from the grid — so the
+    /// song-duration readout is `round(pulse * samples_per_pulse)` like every other
+    /// position in the project, never a sum of section lengths (invariant 2).
+    pub song_end_sample: i64,
+    /// `loopable_at_or_after[i]` is true when section `i` or any section after it is
+    /// `loopable`. Index-aligned with `sections`. A loopable section repeats an
+    /// unknown number of times, so once one is in play or still ahead, the song's
+    /// remaining time is genuinely unknowable and §9.1 requires reporting it as
+    /// unknown rather than counting down to a boundary that will move. Precomputed
+    /// so `push_status` is a single indexed read on the audio thread.
+    pub loopable_at_or_after: Vec<bool>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -196,6 +208,19 @@ pub fn prepare_loaded(
         .map(|i| cues.get(i).cloned())
         .collect();
 
+    // §9.1 song-length data, computed once here rather than on the audio thread.
+    // Performance-time bars are the *sum of section lengths* (the order is the
+    // performance order, §7), but the sample position of that end bar still goes
+    // through the grid, so it rounds identically to every other event position.
+    let total_perf_bars: i64 = song.sections.iter().map(|s| s.length_bars as i64).sum();
+    let song_end_sample = grid.pulse_to_sample(grid.bar_to_pulse(total_perf_bars));
+    let mut loopable_at_or_after = vec![false; song.sections.len()];
+    let mut seen_loopable = false;
+    for (i, sec) in song.sections.iter().enumerate().rev() {
+        seen_loopable |= sec.loopable;
+        loopable_at_or_after[i] = seen_loopable;
+    }
+
     Ok(Box::new(Loaded {
         core,
         meta: SongMeta {
@@ -205,6 +230,8 @@ pub fn prepare_loaded(
             cue_clips,
             bus_channels,
             count_in_bars: song.count_in_bars.min(4),
+            song_end_sample,
+            loopable_at_or_after,
         },
     }))
 }
@@ -284,6 +311,18 @@ pub struct Status {
     pub queued: QueuedStatus,
     /// Whole bars left in the active entry (counts down; 1 during the final bar).
     pub bars_remaining: u32,
+    /// Seconds until the active entry's end (§9.1). Reflects a queued advance as soon
+    /// as it is queued, because advancing rewrites the active entry's end. 0.0 when
+    /// nothing is active.
+    pub section_seconds_remaining: f64,
+    /// Performance-time position in seconds. **Negative during a count-in** (§6),
+    /// matching `perf_sample`; the UI shows its count-in indicator then.
+    pub song_position_seconds: f64,
+    /// Total length of the section order in seconds.
+    pub song_duration_seconds: f64,
+    /// Seconds until the end of the section order, or `None` when a `loopable`
+    /// section is active or still ahead and the end is therefore not knowable (§9.1).
+    pub song_seconds_remaining: Option<f64>,
     /// Pulses remaining until the count-in's target downbeat (§6); `Some`,
     /// decrementing to 0, only while a count-in is in progress, `None` otherwise
     /// (including once playback has started). The performance view's count-in
@@ -859,22 +898,47 @@ impl RtEngine {
     }
 
     fn push_status(&mut self) {
-        let (section, bars_remaining, perf_sample, song_loaded) = match self.loaded.as_ref() {
-            Some(l) => {
-                let perf = l.core.perf_pos();
-                match l.core.active() {
-                    Some(a) => {
-                        let ppb = l.meta.grid.pulses_per_bar();
-                        let remaining_pulses =
-                            (a.perf_end_pulse - l.meta.grid.sample_to_pulse(perf)).max(0);
-                        let bars = ((remaining_pulses + ppb - 1) / ppb).max(0) as u32;
-                        (a.section_index as i32, bars, perf, true)
+        let secs = |samples: i64| samples as f64 / self.engine_rate as f64;
+        let (section, bars_remaining, section_seconds_remaining, perf_sample, song_loaded) =
+            match self.loaded.as_ref() {
+                Some(l) => {
+                    let perf = l.core.perf_pos();
+                    match l.core.active() {
+                        Some(a) => {
+                            let ppb = l.meta.grid.pulses_per_bar();
+                            let remaining_pulses =
+                                (a.perf_end_pulse - l.meta.grid.sample_to_pulse(perf)).max(0);
+                            let bars = ((remaining_pulses + ppb - 1) / ppb).max(0) as u32;
+                            // §9.1: from the entry's end *sample*, not its bar count,
+                            // so the readout stays smooth within the final bar. An
+                            // advance rewrites `perf_end_sample`, so a queued advance
+                            // shortens this the moment it is queued.
+                            let secs_left = secs((a.perf_end_sample - perf).max(0));
+                            (a.section_index as i32, bars, secs_left, perf, true)
+                        }
+                        None => (-1, 0, 0.0, perf, true),
                     }
-                    None => (-1, 0, perf, true),
                 }
-            }
-            None => (-1, 0, 0, false),
-        };
+                None => (-1, 0, 0.0, 0, false),
+            };
+        // §9.1 song-level time. `song_seconds_remaining` is `None` whenever a
+        // loopable section is active or still ahead: its repeat count isn't knowable,
+        // so any number here would be a lie the UI would display in large type.
+        let (song_position_seconds, song_duration_seconds, song_seconds_remaining) =
+            match self.loaded.as_ref() {
+                Some(l) => {
+                    let unknown_end = section >= 0
+                        && l.meta
+                            .loopable_at_or_after
+                            .get(section as usize)
+                            .copied()
+                            .unwrap_or(false);
+                    let remaining =
+                        (!unknown_end).then(|| secs((l.meta.song_end_sample - perf_sample).max(0)));
+                    (secs(perf_sample), secs(l.meta.song_end_sample), remaining)
+                }
+                None => (0.0, 0.0, None),
+            };
         // §6: pulses remaining until the count-in's target downbeat, read from the
         // grid (never a separately-maintained counter) so it can't drift from the
         // click that's actually sounding.
@@ -895,6 +959,10 @@ impl RtEngine {
             section,
             queued,
             bars_remaining,
+            section_seconds_remaining,
+            song_position_seconds,
+            song_duration_seconds,
+            song_seconds_remaining,
             count_in_beats_remaining,
             engine_rate: self.engine_rate,
             song_loaded,
